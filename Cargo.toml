@@ -1,0 +1,28 @@
+[package]
+name = "sabissbackend"
+version = "0.1.0"
+edition = "2024"
+default-run = "sabissbackend"
+
+[dependencies]
+anyhow = "1.0.100"
+axum = "0.8.6"
+base64 = "0.22.1"
+chrono = { version = "0.4.42", features = ["serde"] }
+data-encoding = "2.9.0"
+dotenvy = "0.15.7"
+ed25519-dalek = "2.2.0"
+ethers-core = "2.0.14"
+hex = "0.4.3"
+jsonwebtoken = "9.3.1"
+reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls"] }
+rust_decimal = { version = "1.36.0", features = ["serde-float"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+sqlx = { version = "0.8.6", default-features = false, features = ["chrono", "macros", "migrate", "postgres", "runtime-tokio-rustls", "uuid", "rust_decimal"] }
+tokio = { version = "1.50.0", features = ["macros", "rt-multi-thread", "time", "net", "process"] }
+tower-http = { version = "0.6.6", features = ["cors", "trace"] }
+tower = { version = "0.5.3", features = ["util"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
+uuid = { version = "1.18.1", features = ["serde", "v4"] }
