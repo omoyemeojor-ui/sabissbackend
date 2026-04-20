@@ -59,6 +59,7 @@ use crate::{
         stellar::{
             bootstrap_market_liquidity as bootstrap_market_liquidity_tx,
             dispute_resolution as dispute_resolution_tx, emergency_resolve_market,
+            ensure_mock_usdc_balance,
             finalize_resolution as finalize_resolution_tx, find_existing_event_binary_market,
             get_market_liquidity as get_market_liquidity_on_chain,
             get_market_prices_batch_best_effort, pause_market as pause_market_tx,
@@ -78,6 +79,7 @@ const DEFAULT_LIST_LIMIT: i64 = 20;
 const MAX_LIST_LIMIT: i64 = 100;
 const DEFAULT_RELATED_LIMIT: usize = 6;
 const MARKET_PRICE_BPS_SCALE: u32 = 10_000;
+const DEFAULT_BINARY_MARKET_YES_BPS: u32 = 5_000;
 const USDC_DECIMALS: usize = 6;
 const PRICE_HISTORY_LOOKBACK_MULTIPLIER: i64 = 48;
 const MAX_PRICE_HISTORY_SNAPSHOT_FETCH: i64 = 2_000;
@@ -458,19 +460,28 @@ pub async fn get_market_quote(
         });
     }
 
-    let snapshot = load_or_fetch_current_market_snapshot(state, &market)
-        .await?
-        .ok_or_else(|| AuthError::not_found("market quote unavailable"))?;
     let trade_stats = crud::get_market_trade_stats_by_market_id(&state.db, market.id).await?;
-    let current_prices = market_current_prices_from_snapshot(&snapshot)?;
+    let snapshot = load_or_fetch_current_market_snapshot(state, &market).await?;
+    let (current_prices, source, as_of) = match snapshot.as_ref() {
+        Some(snapshot) => (
+            market_current_prices_from_snapshot(snapshot)?,
+            "fixed_price_pool".to_owned(),
+            snapshot.synced_at,
+        ),
+        None => (
+            fallback_current_prices_from_trade_stats(trade_stats.as_ref())?,
+            "fixed_price_pool_fallback".to_owned(),
+            Utc::now(),
+        ),
+    };
     let last_trade_yes_bps =
         derive_last_trade_yes_bps(trade_stats.as_ref(), current_prices.yes_bps)?;
 
     Ok(MarketQuoteResponse {
         market_id: market.id,
         condition_id: market.condition_id.clone(),
-        source: "fixed_price_pool".to_owned(),
-        as_of: snapshot.synced_at,
+        source,
+        as_of,
         buy_yes_bps: current_prices.yes_bps,
         buy_no_bps: current_prices.no_bps,
         sell_yes_bps: current_prices.yes_bps,
@@ -503,22 +514,50 @@ pub async fn get_market_orderbook(
         });
     }
 
-    let snapshot = load_or_fetch_current_market_snapshot(state, &market)
-        .await?
-        .ok_or_else(|| AuthError::not_found("market orderbook unavailable"))?;
-    let current_prices = market_current_prices_from_snapshot(&snapshot)?;
-    let liquidity = get_market_liquidity_on_chain(&state.env, required_condition_id(&market)?)
-        .await
-        .map_err(|error| AuthError::internal("failed to read market liquidity", error))?;
     let trade_stats = crud::get_market_trade_stats_by_market_id(&state.db, market.id).await?;
+    let snapshot = load_or_fetch_current_market_snapshot(state, &market).await?;
+    let (current_prices, source, as_of) = match snapshot.as_ref() {
+        Some(snapshot) => (
+            market_current_prices_from_snapshot(snapshot)?,
+            "synthetic_fixed_price_pool".to_owned(),
+            snapshot.synced_at,
+        ),
+        None => (
+            fallback_current_prices_from_trade_stats(trade_stats.as_ref())?,
+            "synthetic_fixed_price_pool_fallback".to_owned(),
+            Utc::now(),
+        ),
+    };
+    let liquidity = match get_market_liquidity_on_chain(&state.env, required_condition_id(&market)?)
+        .await
+    {
+        Ok(liquidity) => liquidity,
+        Err(error) => {
+            tracing::warn!(
+                market_id = %market.id,
+                condition_id = ?market.condition_id,
+                error = %error,
+                "unable to read on-chain market liquidity for orderbook fallback"
+            );
+            crate::service::stellar::MarketLiquidityReadResult {
+                yes_available: "0".to_owned(),
+                no_available: "0".to_owned(),
+                idle_yes_total: "0".to_owned(),
+                idle_no_total: "0".to_owned(),
+                posted_yes_total: "0".to_owned(),
+                posted_no_total: "0".to_owned(),
+                claimable_collateral_total: "0".to_owned(),
+            }
+        }
+    };
     let last_trade_yes_bps =
         derive_last_trade_yes_bps(trade_stats.as_ref(), current_prices.yes_bps)?;
 
     Ok(MarketOrderbookResponse {
         market_id: market.id,
         condition_id: market.condition_id.clone(),
-        source: "synthetic_fixed_price_pool".to_owned(),
-        as_of: snapshot.synced_at,
+        source,
+        as_of,
         spread_bps: 0,
         last_trade_yes_bps,
         bids: build_synthetic_pool_bids(
@@ -1286,6 +1325,18 @@ pub async fn bootstrap_market_liquidity(
         "exit_collateral_usdc_amount",
         true,
     )?;
+    let required_admin_collateral = sum_u128_decimal_strings(
+        &inventory_usdc_amount,
+        &exit_collateral_usdc_amount,
+        "bootstrap collateral",
+    )?;
+    ensure_mock_usdc_balance(
+        &state.env,
+        &state.env.admin,
+        &required_admin_collateral.to_string(),
+    )
+    .await
+    .map_err(|error| map_admin_chain_error("market liquidity bootstrap funding", error))?;
 
     let tx = bootstrap_market_liquidity_tx(
         &state.env,
@@ -1370,6 +1421,18 @@ pub async fn bootstrap_event_liquidity(
             "exit_collateral_usdc_amount",
             true,
         )?;
+        let required_admin_collateral = sum_u128_decimal_strings(
+            &inventory_usdc_amount,
+            &exit_collateral_usdc_amount,
+            "event bootstrap collateral",
+        )?;
+        ensure_mock_usdc_balance(
+            &state.env,
+            &state.env.admin,
+            &required_admin_collateral.to_string(),
+        )
+        .await
+        .map_err(|error| map_admin_chain_error("event liquidity bootstrap funding", error))?;
 
         let tx = bootstrap_market_liquidity_tx(
             &state.env,
@@ -2180,9 +2243,26 @@ async fn build_market_liquidity_response(
     market: &MarketRecord,
 ) -> Result<MarketLiquidityResponse, AuthError> {
     let condition_id = required_condition_id(market)?;
-    let liquidity = get_market_liquidity_on_chain(&state.env, condition_id)
-        .await
-        .map_err(|error| AuthError::internal("market liquidity read failed", error))?;
+    let liquidity = match get_market_liquidity_on_chain(&state.env, condition_id).await {
+        Ok(liquidity) => liquidity,
+        Err(error) => {
+            tracing::warn!(
+                market_id = %market.id,
+                condition_id,
+                ?error,
+                "falling back to zero liquidity because on-chain market state is unavailable"
+            );
+            crate::service::stellar::MarketLiquidityReadResult {
+                yes_available: "0".to_owned(),
+                no_available: "0".to_owned(),
+                idle_yes_total: "0".to_owned(),
+                idle_no_total: "0".to_owned(),
+                posted_yes_total: "0".to_owned(),
+                posted_no_total: "0".to_owned(),
+                claimable_collateral_total: "0".to_owned(),
+            }
+        }
+    };
 
     Ok(MarketLiquidityResponse::new(
         market,
@@ -2370,7 +2450,8 @@ async fn build_public_market_cards_from_market_records_with_current_prices(
                 .condition_id
                 .as_ref()
                 .and_then(|condition_id| prices_by_condition.get(condition_id))
-                .cloned();
+                .cloned()
+                .or_else(|| market.condition_id.as_ref().map(|_| fallback_current_prices()));
 
             PublicMarketCardResponse {
                 current_prices,
@@ -2388,7 +2469,8 @@ fn build_market_response_with_current_prices(
         .condition_id
         .as_ref()
         .and_then(|condition_id| prices_by_condition.get(condition_id))
-        .cloned();
+        .cloned()
+        .or_else(|| market.condition_id.as_ref().map(|_| fallback_current_prices()));
 
     MarketResponse {
         current_prices,
@@ -2405,13 +2487,25 @@ fn build_event_market_response(
         .condition_id
         .as_ref()
         .and_then(|condition_id| snapshots_by_condition.get(condition_id));
-    let current_prices = snapshot
-        .map(market_current_prices_from_snapshot)
-        .transpose()?;
-    let quote_summary = snapshot
-        .map(build_market_quote_summary_from_snapshot)
-        .transpose()?;
     let trade_stats = stats_by_market_id.get(&market.id);
+    let current_prices = match snapshot {
+        Some(snapshot) => Some(market_current_prices_from_snapshot(snapshot)?),
+        None => market
+            .condition_id
+            .as_ref()
+            .map(|_| fallback_current_prices_from_trade_stats(trade_stats))
+            .transpose()?,
+    };
+    let quote_summary = match snapshot {
+        Some(snapshot) => Some(build_market_quote_summary_from_snapshot(snapshot)?),
+        None => current_prices.as_ref().map(|current_prices| {
+            build_market_quote_summary_from_prices(
+                current_prices,
+                "price_snapshot_fallback",
+                Utc::now(),
+            )
+        }),
+    };
     let stats = Some(build_market_stats_response(trade_stats));
     let last_trade_yes_bps = current_prices
         .as_ref()
@@ -2436,13 +2530,25 @@ fn build_public_market_card_response(
         .condition_id
         .as_ref()
         .and_then(|condition_id| snapshots_by_condition.get(condition_id));
-    let current_prices = snapshot
-        .map(market_current_prices_from_snapshot)
-        .transpose()?;
-    let quote_summary = snapshot
-        .map(build_market_quote_summary_from_snapshot)
-        .transpose()?;
     let trade_stats = stats_by_market_id.get(&market.market_id);
+    let current_prices = match snapshot {
+        Some(snapshot) => Some(market_current_prices_from_snapshot(snapshot)?),
+        None => market
+            .condition_id
+            .as_ref()
+            .map(|_| fallback_current_prices_from_trade_stats(trade_stats))
+            .transpose()?,
+    };
+    let quote_summary = match snapshot {
+        Some(snapshot) => Some(build_market_quote_summary_from_snapshot(snapshot)?),
+        None => current_prices.as_ref().map(|current_prices| {
+            build_market_quote_summary_from_prices(
+                current_prices,
+                "price_snapshot_fallback",
+                Utc::now(),
+            )
+        }),
+    };
     let stats = Some(build_market_stats_response(trade_stats));
     let last_trade_yes_bps = current_prices
         .as_ref()
@@ -2701,17 +2807,57 @@ fn market_current_prices_from_snapshot(
     Ok(MarketCurrentPricesResponse { yes_bps, no_bps })
 }
 
+fn fallback_current_prices() -> MarketCurrentPricesResponse {
+    MarketCurrentPricesResponse {
+        yes_bps: DEFAULT_BINARY_MARKET_YES_BPS,
+        no_bps: MARKET_PRICE_BPS_SCALE - DEFAULT_BINARY_MARKET_YES_BPS,
+    }
+}
+
+fn fallback_current_prices_from_trade_stats(
+    stats: Option<&MarketTradeStatsRecord>,
+) -> Result<MarketCurrentPricesResponse, AuthError> {
+    let Some(last_trade_yes_bps) = stats.and_then(|record| record.last_trade_yes_bps) else {
+        return Ok(fallback_current_prices());
+    };
+    let yes_bps = u32::try_from(last_trade_yes_bps)
+        .map_err(|error| AuthError::internal("invalid last trade fallback price", error))?;
+    if yes_bps > MARKET_PRICE_BPS_SCALE {
+        return Err(AuthError::internal(
+            "invalid last trade fallback price",
+            anyhow!("last trade fallback price exceeds basis-point scale"),
+        ));
+    }
+
+    Ok(MarketCurrentPricesResponse {
+        yes_bps,
+        no_bps: MARKET_PRICE_BPS_SCALE - yes_bps,
+    })
+}
+
 fn build_market_quote_summary_from_snapshot(
     snapshot: &MarketPriceSnapshotRecord,
 ) -> Result<MarketQuoteSummaryResponse, AuthError> {
     let current_prices = market_current_prices_from_snapshot(snapshot)?;
 
-    Ok(MarketQuoteSummaryResponse {
+    Ok(build_market_quote_summary_from_prices(
+        &current_prices,
+        "price_snapshot",
+        snapshot.synced_at,
+    ))
+}
+
+fn build_market_quote_summary_from_prices(
+    current_prices: &MarketCurrentPricesResponse,
+    source: &str,
+    as_of: chrono::DateTime<Utc>,
+) -> MarketQuoteSummaryResponse {
+    MarketQuoteSummaryResponse {
         buy_yes_bps: current_prices.yes_bps,
         buy_no_bps: current_prices.no_bps,
-        as_of: snapshot.synced_at,
-        source: "price_snapshot".to_owned(),
-    })
+        as_of,
+        source: source.to_owned(),
+    }
 }
 
 fn build_market_stats_response(stats: Option<&MarketTradeStatsRecord>) -> MarketStatsResponse {
@@ -3306,6 +3452,17 @@ fn normalize_u256_decimal(
     Ok(parsed.to_string())
 }
 
+fn sum_u128_decimal_strings(left: &str, right: &str, field_name: &str) -> Result<u128, AuthError> {
+    let left = left
+        .parse::<u128>()
+        .map_err(|_| AuthError::bad_request(format!("{field_name} is not a valid u128 amount")))?;
+    let right = right
+        .parse::<u128>()
+        .map_err(|_| AuthError::bad_request(format!("{field_name} is not a valid u128 amount")))?;
+    left.checked_add(right)
+        .ok_or_else(|| AuthError::bad_request(format!("{field_name} overflowed u128")))
+}
+
 fn map_admin_chain_error(action: &'static str, error: anyhow::Error) -> AuthError {
     let message = format!("{error:#}");
     tracing::error!(%message, action, "admin chain action failed");
@@ -3596,21 +3753,22 @@ fn normalize_slug(raw: &str, field_name: &str) -> Result<String, AuthError> {
 }
 
 fn normalize_bytes32(raw: &str, field_name: &str) -> Result<String, AuthError> {
-    let value = raw.trim().to_ascii_lowercase();
+    let trimmed = raw.trim().trim_matches('"').to_ascii_lowercase();
+    let hex = trimmed.strip_prefix("0x").unwrap_or(&trimmed);
 
-    if value.len() != 66 || !value.starts_with("0x") {
+    if hex.len() != 64 {
         return Err(AuthError::bad_request(format!(
             "{field_name} must be a 32-byte hex string",
         )));
     }
 
-    if !value[2..].chars().all(|ch| ch.is_ascii_hexdigit()) {
+    if !hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
         return Err(AuthError::bad_request(format!(
             "{field_name} must be a 32-byte hex string",
         )));
     }
 
-    Ok(value)
+    Ok(format!("0x{hex}"))
 }
 
 fn normalize_optional_slug(raw: Option<&str>) -> Result<Option<String>, AuthError> {

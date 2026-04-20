@@ -7,7 +7,7 @@ default-run = "sabissbackend"
 [dependencies]
 aes-gcm = "0.10.3"
 anyhow = "1.0.100"
-axum = "0.8.6"
+axum = { version = "0.8.6", features = ["multipart"] }
 base64 = "0.22.1"
 chrono = { version = "0.4.42", features = ["serde"] }
 data-encoding = "2.9.0"
@@ -17,10 +17,11 @@ ethers-core = "2.0.14"
 hex = "0.4.3"
 jsonwebtoken = "9.3.1"
 rand = "0.8.5"
-reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12.24", default-features = false, features = ["json", "multipart", "rustls-tls"] }
 rust_decimal = { version = "1.36.0", features = ["serde-float"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
+sha2 = "0.10.9"
 sqlx = { version = "0.8.6", default-features = false, features = ["chrono", "macros", "migrate", "postgres", "runtime-tokio-rustls", "uuid", "rust_decimal"] }
 thiserror = "2.0.17"
 tokio = { version = "1.50.0", features = ["macros", "rt-multi-thread", "time", "net", "process"] }

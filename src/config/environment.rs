@@ -47,6 +47,14 @@ pub struct Environment {
     pub sabi_exchange_id: String,
     pub sabi_liquidity_manager_id: String,
     pub sabi_neg_risk_id: String,
+    pub filebase_bucket_name: Option<String>,
+    pub filebase_s3_endpoint: Option<String>,
+    pub filebase_region: Option<String>,
+    pub filebase_access_key: Option<String>,
+    pub filebase_secret_key: Option<String>,
+    pub filebase_gateway_base_url: Option<String>,
+    pub filebase_ipfs_rpc_url: Option<String>,
+    pub filebase_ipfs_rpc_token: Option<String>,
 }
 
 impl Environment {
@@ -112,6 +120,14 @@ impl Environment {
             sabi_exchange_id: required_env("SABI_EXCHANGE_ID")?,
             sabi_liquidity_manager_id: required_env("SABI_LIQUIDITY_MANAGER_ID")?,
             sabi_neg_risk_id: required_env("SABI_NEG_RISK_ID")?,
+            filebase_bucket_name: optional_env("FILEBASE_BUCKET_NAME"),
+            filebase_s3_endpoint: optional_env("FILEBASE_S3_ENDPOINT"),
+            filebase_region: optional_env("FILEBASE_REGION"),
+            filebase_access_key: optional_env("FILEBASE_ACCESS_KEY"),
+            filebase_secret_key: optional_env("FILEBASE_SECRET_KEY"),
+            filebase_gateway_base_url: optional_env("FILEBASE_GATEWAY_BASE_URL"),
+            filebase_ipfs_rpc_url: optional_env("FILEBASE_IPFS_RPC_URL"),
+            filebase_ipfs_rpc_token: optional_env("FILEBASE_IPFS_RPC_TOKEN"),
         })
         .map(|mut env| {
             env.admin_wallet_addresses = if configured_admins.is_empty() {

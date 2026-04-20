@@ -89,6 +89,7 @@ async fn main() -> Result<()> {
     println!("admin address: {public_key}");
     println!("challenge_id: {}", challenge.challenge_id);
     println!("challenge_expires_at: {}", challenge.expires_at);
+    println!("token: {}", auth.token);
     println!("jwt_prefix: {}", &auth.token[..auth.token.len().min(24)]);
     println!("result: admin auth flow succeeded");
 

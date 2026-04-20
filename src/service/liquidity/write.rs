@@ -179,9 +179,8 @@ async fn execute_market_write(
             no_amount,
         } => {
             chain_write::deposit_inventory(
-                &state.env,
-                &state.http_client,
-                &wallet,
+                state,
+                authenticated_user.user_id,
                 condition_id,
                 *yes_amount,
                 *no_amount,
@@ -190,9 +189,8 @@ async fn execute_market_write(
         }
         LiquidityWriteAction::DepositCollateral { amount } => {
             chain_write::deposit_collateral(
-                &state.env,
-                &state.http_client,
-                &wallet,
+                state,
+                authenticated_user.user_id,
                 condition_id,
                 *amount,
             )
@@ -203,9 +201,8 @@ async fn execute_market_write(
             no_amount,
         } => {
             chain_write::remove_liquidity(
-                &state.env,
-                &state.http_client,
-                &wallet,
+                state,
+                authenticated_user.user_id,
                 condition_id,
                 *yes_amount,
                 *no_amount,
@@ -218,9 +215,8 @@ async fn execute_market_write(
             recipient,
         } => {
             chain_write::withdraw_inventory(
-                &state.env,
-                &state.http_client,
-                &wallet,
+                state,
+                authenticated_user.user_id,
                 condition_id,
                 *yes_amount,
                 *no_amount,
@@ -230,9 +226,8 @@ async fn execute_market_write(
         }
         LiquidityWriteAction::WithdrawCollateral { amount, recipient } => {
             chain_write::withdraw_collateral(
-                &state.env,
-                &state.http_client,
-                &wallet,
+                state,
+                authenticated_user.user_id,
                 condition_id,
                 *amount,
                 recipient,

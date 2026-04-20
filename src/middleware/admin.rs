@@ -19,12 +19,16 @@ pub async fn require_admin(
     let wallet = crud::get_wallet_for_user(&state.db, authenticated_user.user_id)
         .await?
         .ok_or_else(|| AuthError::forbidden("admin wallet not linked"))?;
-    let wallet_address = wallet
+    let is_admin = wallet
         .wallet_address
         .as_deref()
-        .ok_or_else(|| AuthError::forbidden("admin wallet is not deployed"))?;
+        .is_some_and(|value| state.env.is_admin_wallet(value))
+        || wallet
+            .owner_ref
+            .as_deref()
+            .is_some_and(|value| state.env.is_admin_wallet(value));
 
-    if !state.env.is_admin_wallet(wallet_address) {
+    if !is_admin {
         return Err(AuthError::forbidden("admin access required"));
     }
 

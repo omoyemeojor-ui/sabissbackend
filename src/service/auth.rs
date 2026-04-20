@@ -5,6 +5,7 @@ use data_encoding::BASE32_NOPAD;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
@@ -19,7 +20,7 @@ use crate::{
         },
     },
     service::{
-        aa::ensure_google_user_smart_wallet,
+        aa::{ensure_google_user_smart_wallet, ensure_wallet_user_smart_wallet},
         jwt::{AuthenticatedUser, create_session_token},
     },
 };
@@ -27,6 +28,8 @@ use crate::{
 const APP_NAME: &str = "Sabiss";
 const WALLET_CHALLENGE_TTL_MINUTES: i64 = 10;
 const STELLAR_ACCOUNT_ID_VERSION_BYTE: u8 = 6 << 3;
+const STELLAR_CONTRACT_ID_VERSION_BYTE: u8 = 2 << 3;
+const FREIGHTER_SIGN_MESSAGE_PREFIX: &str = "Stellar Signed Message:\n";
 
 pub async fn sign_in_with_google(
     state: &AppState,
@@ -136,6 +139,17 @@ pub fn normalize_wallet_address(raw: &str) -> Result<String, AuthError> {
     Ok(normalized)
 }
 
+pub fn normalize_stellar_address(raw: &str) -> Result<String, AuthError> {
+    let normalized = raw.trim().to_ascii_uppercase();
+    if decode_stellar_public_key(&normalized).is_ok()
+        || decode_stellar_contract_id(&normalized).is_ok()
+    {
+        return Ok(normalized);
+    }
+
+    Err(AuthError::bad_request("invalid stellar address"))
+}
+
 pub fn normalize_username(raw: &str) -> Result<String, AuthError> {
     let username = raw.trim().to_ascii_lowercase();
 
@@ -198,6 +212,7 @@ pub(crate) async fn complete_wallet_connection(
             return Err(AuthError::unauthorized("invalid wallet challenge"));
         }
 
+        ensure_wallet_user_smart_wallet(state, &user, &challenge.wallet_address).await?;
         return build_auth_response(state, user).await;
     }
 
@@ -217,6 +232,7 @@ pub(crate) async fn complete_wallet_connection(
     )
     .await?;
 
+    ensure_wallet_user_smart_wallet(state, &user, &challenge.wallet_address).await?;
     build_auth_response(state, user).await
 }
 
@@ -239,8 +255,31 @@ fn verify_wallet_signature(
     let signature_bytes = decode_signature(raw_signature)?;
     let signature = Signature::from_bytes(&signature_bytes);
 
-    verifying_key
+    // Try verifying against the raw message first
+    if verifying_key
         .verify(challenge.message.as_bytes(), &signature)
+        .is_ok()
+    {
+        return Ok(());
+    }
+
+    // Freighter signMessage signs SHA256("Stellar Signed Message:\n" + message)
+    let freighter_signed_payload =
+        format!("{FREIGHTER_SIGN_MESSAGE_PREFIX}{}", challenge.message);
+    let freighter_message_hash = Sha256::digest(freighter_signed_payload.as_bytes());
+    if verifying_key
+        .verify(freighter_message_hash.as_slice(), &signature)
+        .is_ok()
+    {
+        return Ok(());
+    }
+
+    // If raw verification fails, try SEP-0010 envelope format
+    // SEP-0010 wraps messages as: "{domain} auth {timestamp}\n{message}"
+    // For web auth, we use a standardized format similar to: "localhost:8080 auth 1234567890\n{message}"
+    let sep10_message = format!("Sabiss auth 0\n{}", challenge.message);
+    verifying_key
+        .verify(sep10_message.as_bytes(), &signature)
         .map_err(|_| AuthError::unauthorized("wallet signature verification failed"))
 }
 
@@ -338,24 +377,36 @@ fn decode_signature(raw: &str) -> Result<[u8; 64], AuthError> {
 }
 
 fn decode_stellar_public_key(value: &str) -> Result<[u8; 32], AuthError> {
+    decode_stellar_address(value, STELLAR_ACCOUNT_ID_VERSION_BYTE, "invalid stellar wallet address")
+}
+
+fn decode_stellar_contract_id(value: &str) -> Result<[u8; 32], AuthError> {
+    decode_stellar_address(value, STELLAR_CONTRACT_ID_VERSION_BYTE, "invalid stellar contract address")
+}
+
+fn decode_stellar_address(
+    value: &str,
+    expected_version_byte: u8,
+    error_message: &'static str,
+) -> Result<[u8; 32], AuthError> {
     let normalized = value.trim().to_ascii_uppercase();
     let decoded = BASE32_NOPAD
         .decode(normalized.as_bytes())
-        .map_err(|_| AuthError::bad_request("invalid stellar wallet address"))?;
+        .map_err(|_| AuthError::bad_request(error_message))?;
 
     if decoded.len() != 35 {
-        return Err(AuthError::bad_request("invalid stellar wallet address"));
+        return Err(AuthError::bad_request(error_message));
     }
 
     let payload = &decoded[..33];
     let checksum = &decoded[33..];
 
-    if payload[0] != STELLAR_ACCOUNT_ID_VERSION_BYTE {
-        return Err(AuthError::bad_request("invalid stellar wallet address"));
+    if payload[0] != expected_version_byte {
+        return Err(AuthError::bad_request(error_message));
     }
 
     if crc16_xmodem(payload).to_le_bytes() != [checksum[0], checksum[1]] {
-        return Err(AuthError::bad_request("invalid stellar wallet address"));
+        return Err(AuthError::bad_request(error_message));
     }
 
     let mut key = [0_u8; 32];

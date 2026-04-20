@@ -5,7 +5,7 @@ use uuid::Uuid;
 use crate::{
     app::AppState,
     module::{
-        auth::{error::AuthError, model::ACCOUNT_KIND_SMART_ACCOUNT},
+        auth::{error::AuthError, model::ACCOUNT_KIND_STELLAR_SMART_WALLET},
         market::trade_schema::{
             BuyMarketRequest, MarketPositionConversionResponse, MarketTradeExecutionResponse,
             MergeMarketRequest, SellMarketRequest, SplitMarketRequest,
@@ -174,7 +174,7 @@ async fn execute_market_trade(
     .await?;
     let market = build_market_response(state, &context.market).await?;
 
-    if wallet.account_kind == ACCOUNT_KIND_SMART_ACCOUNT {
+    if wallet.account_kind == ACCOUNT_KIND_STELLAR_SMART_WALLET {
         return execute_smart_account_trade(
             state,
             authenticated_user,
@@ -213,14 +213,13 @@ async fn execute_market_conversion(
     let wallet = load_wallet_account_context(state, authenticated_user.user_id).await?;
     let market = build_market_response(state, &context.market).await?;
 
-    if wallet.account_kind == ACCOUNT_KIND_SMART_ACCOUNT {
-        let signer = load_smart_account_context(state, authenticated_user.user_id).await?;
+    if wallet.account_kind == ACCOUNT_KIND_STELLAR_SMART_WALLET {
+        let _signer = load_smart_account_context(state, authenticated_user.user_id).await?;
         let tx = match action {
             ConversionWriteAction::Split { collateral_amount } => {
                 chain_write::split_position(
-                    &state.env,
-                    &state.http_client,
-                    &signer,
+                    state,
+                    authenticated_user.user_id,
                     &context.condition_id,
                     collateral_amount,
                 )
@@ -228,9 +227,8 @@ async fn execute_market_conversion(
             }
             ConversionWriteAction::Merge { pair_token_amount } => {
                 chain_write::merge_positions(
-                    &state.env,
-                    &state.http_client,
-                    &signer,
+                    state,
+                    authenticated_user.user_id,
                     &context.condition_id,
                     pair_token_amount,
                 )
@@ -306,16 +304,15 @@ async fn execute_smart_account_trade(
     executed_amounts: ExecutedAmounts,
     market: crate::module::market::schema::MarketResponse,
 ) -> Result<MarketTradeExecutionResponse, AuthError> {
-    let signer = load_smart_account_context(state, authenticated_user.user_id).await?;
+    let _signer = load_smart_account_context(state, authenticated_user.user_id).await?;
     let tx = match action {
         TradeWriteAction::Buy {
             outcome_index,
             usdc_amount,
         } => {
             chain_write::buy_outcome(
-                &state.env,
-                &state.http_client,
-                &signer,
+                state,
+                authenticated_user.user_id,
                 &context.condition_id,
                 outcome_index,
                 usdc_amount,
@@ -327,9 +324,8 @@ async fn execute_smart_account_trade(
             token_amount,
         } => {
             chain_write::sell_outcome(
-                &state.env,
-                &state.http_client,
-                &signer,
+                state,
+                authenticated_user.user_id,
                 &context.condition_id,
                 outcome_index,
                 token_amount,

@@ -3,6 +3,9 @@ use serde::Serialize;
 #[derive(Debug, Serialize)]
 pub struct PublicContractsConfigResponse {
     pub chain_id: i64,
+    pub network: String,
+    pub rpc_url: String,
+    pub horizon_url: String,
     pub contracts: PublicContractsAddressesResponse,
 }
 
@@ -16,4 +19,6 @@ pub struct PublicContractsAddressesResponse {
     pub orderbook_exchange: String,
     pub redemption: String,
     pub neg_risk_adapter: String,
+    pub wallet_factory: Option<String>,
+    pub wallet_web_auth: Option<String>,
 }

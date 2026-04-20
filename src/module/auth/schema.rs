@@ -87,8 +87,9 @@ impl UserResponse {
 
 impl From<WalletRecord> for WalletResponse {
     fn from(value: WalletRecord) -> Self {
+        let wallet_address = frontend_wallet_address(&value);
         Self {
-            wallet_address: value.wallet_address.unwrap_or_default(),
+            wallet_address,
             chain_id: wallet_chain_id(&value.network),
             account_kind: frontend_account_kind(&value.account_kind),
             owner_address: value.owner_address,
@@ -114,4 +115,16 @@ fn frontend_account_kind(account_kind: &str) -> String {
         "classic_account" => "external_eoa".to_owned(),
         other => other.to_owned(),
     }
+}
+
+fn frontend_wallet_address(wallet: &WalletRecord) -> String {
+    if wallet.account_kind == "stellar_smart_wallet" {
+        return wallet
+            .owner_address
+            .clone()
+            .or_else(|| wallet.wallet_address.clone())
+            .unwrap_or_default();
+    }
+
+    wallet.wallet_address.clone().unwrap_or_default()
 }

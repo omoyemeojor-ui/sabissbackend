@@ -18,8 +18,12 @@ use crate::{
     config::{db::DbPool, environment::Environment},
     module::{
         admin::route::router as admin_router, auth::route::router as auth_router,
+        comment::route::{me_router as me_comment_router, public_router as public_comment_router},
+        faucet::route::public_router as faucet_router,
         liquidity::route::{me_router as me_liquidity_router, public_router as public_liquidity_router},
         market::route::{me_router as me_market_router, public_router as public_market_router},
+        order::route::me_router as me_order_router,
+        public_config::route::public_router as public_config_router,
     },
 };
 
@@ -36,8 +40,13 @@ pub fn build_router(state: AppState) -> Result<Router> {
         .nest("/auth", auth_router(state.clone()))
         .nest("/admin", admin_router(state.clone()))
         .merge(public_market_router())
+        .merge(public_comment_router())
         .merge(public_liquidity_router())
+        .merge(faucet_router())
+        .merge(public_config_router())
         .merge(me_market_router(state.clone()))
+        .merge(me_order_router(state.clone()))
+        .merge(me_comment_router(state.clone()))
         .merge(me_liquidity_router(state.clone()))
         .with_state(state.clone())
         .layer(build_cors_layer(&state.env)?)
@@ -57,7 +66,13 @@ fn build_cors_layer(env: &Environment) -> Result<CorsLayer> {
     Ok(CorsLayer::new()
         .allow_origin(AllowOrigin::list(allowed_origins))
         .allow_credentials(true)
-        .allow_methods([Method::GET, Method::POST, Method::PATCH, Method::OPTIONS])
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
         .allow_headers([header::ACCEPT, header::AUTHORIZATION, header::CONTENT_TYPE]))
 }
 

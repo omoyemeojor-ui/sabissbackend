@@ -359,7 +359,7 @@ pub async fn ensure_google_smart_wallet(
         .map_err(AuthError::from)
 }
 
-pub struct ManagedGoogleWalletUpsert<'a> {
+pub struct ManagedWalletUpsert<'a> {
     pub wallet_address: &'a str,
     pub owner_address: &'a str,
     pub owner_ref: &'a str,
@@ -368,12 +368,12 @@ pub struct ManagedGoogleWalletUpsert<'a> {
     pub owner_key_version: i32,
 }
 
-pub async fn upsert_google_managed_wallet(
+pub async fn upsert_managed_wallet(
     pool: &DbPool,
     env: &Environment,
     user_id: Uuid,
-    google_sub: &str,
-    wallet: &ManagedGoogleWalletUpsert<'_>,
+    owner_provider: &str,
+    wallet: &ManagedWalletUpsert<'_>,
 ) -> Result<WalletRecord, AuthError> {
     sqlx::query_as::<_, WalletRecord>(sql::UPSERT_GOOGLE_MANAGED_SMART_WALLET)
         .bind(Uuid::new_v4())
@@ -384,8 +384,8 @@ pub async fn upsert_google_managed_wallet(
         .bind(WALLET_STATUS_ACTIVE)
         .bind("sabi_wallet")
         .bind(wallet.owner_address)
-        .bind("google_oidc")
-        .bind(google_sub)
+        .bind(owner_provider)
+        .bind(wallet.owner_ref)
         .bind(&env.stellar_aa_sponsor_address)
         .bind(&env.stellar_aa_relayer_kind)
         .bind(env.stellar_aa_relayer_url.as_deref())

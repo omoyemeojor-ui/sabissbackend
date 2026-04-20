@@ -1,24 +1,15 @@
-use std::{
-    collections::{BTreeSet, HashMap},
-    str::FromStr,
-};
+use std::collections::{BTreeSet, HashMap};
 
-use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
-use ethers_contract::Contract;
-use ethers_core::{
-    abi::{Abi, AbiParser, Token, encode},
-    types::{Address, Bytes, H256, Signature, U256},
-    utils::keccak256,
-};
-use ethers_providers::{Http, Middleware, Provider};
-use tokio::task::JoinSet;
+use ethers_core::{types::U256, utils::keccak256};
+use uuid::Uuid;
 
 use crate::{
     app::AppState,
-    config::environment::Environment,
     module::{
-        auth::{error::AuthError, model::ACCOUNT_KIND_SMART_ACCOUNT},
+        auth::{
+            crud as auth_crud, error::AuthError, model::ACCOUNT_KIND_STELLAR_SMART_WALLET,
+        },
         market::{
             crud as market_crud,
             model::{MarketEventRecord, MarketRecord},
@@ -33,11 +24,7 @@ use crate::{
     service::{
         faucet::read_usdc_balance,
         jwt::AuthenticatedUser,
-        liquidity::{
-            view::build_market_responses,
-            wallet::{WalletAccountContext, load_wallet_account_context},
-        },
-        rpc,
+        liquidity::view::build_market_responses,
         trading::{
             context::{load_trading_market_context, outcome_label},
             format::{
@@ -45,25 +32,22 @@ use crate::{
                 validate_trade_value_bounds,
             },
         },
+        stellar,
     },
 };
-use uuid::Uuid;
 
 const ORDER_STATUS_CANCELLED: &str = "cancelled";
 const ORDER_STATUS_OPEN: &str = "open";
 const ORDER_STATUS_PARTIALLY_FILLED: &str = "partially_filled";
 const ORDER_SIDE_BUY: &str = "buy";
 const ORDER_SIDE_SELL: &str = "sell";
-const ORDER_DOMAIN_NAME: &str = "Sabi Exchange";
-const ORDER_DOMAIN_VERSION: &str = "1";
-const ORDER_DOMAIN_TYPE: &str =
-    "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)";
-const ORDER_TYPE: &str = "Order(address maker,bytes32 conditionId,uint256 outcomeIndex,uint8 side,uint256 price,uint256 amount,uint256 expiry,uint256 salt)";
-const ERC1271_MAGIC_VALUE: [u8; 4] = [0x16, 0x26, 0xba, 0x7e];
-const MAX_CONCURRENT_POSITION_ID_READS: usize = 8;
-const MARKET_BALANCE_BATCH_SIZE: usize = 24;
 
-type ReadProvider = Provider<Http>;
+#[derive(Clone)]
+struct OrderWalletContext {
+    wallet_address: String,
+    account_kind: String,
+    actor_address: String,
+}
 
 struct PositionSnapshot {
     event: MarketEventRecord,
@@ -82,20 +66,12 @@ struct PortfolioMarketAccumulator {
     last_traded_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct MarketPositionIds {
-    market_id: Uuid,
-    yes_position_id: U256,
-    no_position_id: U256,
-}
-
 pub async fn place_order(
     state: &AppState,
     authenticated_user: AuthenticatedUser,
     payload: CreateOrderRequest,
 ) -> Result<CreateOrderResponse, AuthError> {
-    let wallet = load_wallet_account_context(state, authenticated_user.user_id).await?;
-
+    let wallet = load_order_wallet_context(state, authenticated_user.user_id).await?;
     let context = load_trading_market_context(state, payload.order.market_id).await?;
     let market =
         crate::service::liquidity::view::build_market_response(state, &context.market).await?;
@@ -104,30 +80,20 @@ pub async fn place_order(
     let price_bps = validate_price_bps(payload.order.price_bps)?;
     let quoted_usdc_amount = quote_usdc_amount(amount, price_bps);
     validate_trade_value_bounds(quoted_usdc_amount, "quoted order value")?;
-
-    let (expiry_epoch_seconds, expiry) = normalize_expiry(payload.order.expiry_epoch_seconds)?;
-    let salt = parse_decimal_u256(&payload.order.salt, "order.salt")?;
-    let maker = parse_address(&wallet.wallet_address, "linked wallet address")?;
-    let condition_id = parse_bytes32(&context.condition_id, "market condition id")?;
-    let order_hash = compute_order_hash(
-        maker,
-        condition_id,
+    let (expiry_epoch_seconds, _expires_at) =
+        normalize_expiry(payload.order.expiry_epoch_seconds)?;
+    let salt = normalize_non_empty(&payload.order.salt, "order.salt")?;
+    let signature = normalize_non_empty(&payload.order.signature, "order.signature")?;
+    let (order_hash, order_digest) = compute_order_identity(
+        &wallet.actor_address,
+        &context.condition_id,
         payload.order.outcome_index,
         side,
         price_bps,
-        amount,
-        expiry,
-        salt,
-    )?;
-    let order_digest = compute_order_digest(&state.env, order_hash)?;
-    verify_order_signature(
-        &state.env,
-        &wallet,
-        &payload.order.signature,
-        order_digest,
-        maker,
-    )
-    .await?;
+        &amount.to_string(),
+        expiry_epoch_seconds,
+        &salt,
+    );
 
     let record = crud::insert_market_order(
         &state.db,
@@ -136,7 +102,7 @@ pub async fn place_order(
             user_id: authenticated_user.user_id,
             market_id: context.market.id,
             event_id: context.event.id,
-            wallet_address: wallet.wallet_address.clone(),
+            wallet_address: wallet.actor_address.clone(),
             account_kind: wallet.account_kind.clone(),
             condition_id: context.condition_id.clone(),
             outcome_index: payload.order.outcome_index,
@@ -147,10 +113,10 @@ pub async fn place_order(
             filled_amount: "0".to_owned(),
             remaining_amount: amount.to_string(),
             expiry_epoch_seconds,
-            salt: salt.to_string(),
-            signature: normalize_signature_hex(&payload.order.signature)?,
-            order_hash: format!("{order_hash:#x}"),
-            order_digest: format!("{order_digest:#x}"),
+            salt,
+            signature,
+            order_hash,
+            order_digest,
             status: ORDER_STATUS_OPEN.to_owned(),
         },
     )
@@ -158,7 +124,6 @@ pub async fn place_order(
     .map_err(map_insert_market_order_error)?;
 
     let order = build_order_item_response(&context.event, &context.market, market, &record)?;
-
     Ok(CreateOrderResponse {
         wallet_address: wallet.wallet_address,
         account_kind: wallet.account_kind,
@@ -171,8 +136,7 @@ pub async fn cancel_existing_order(
     authenticated_user: AuthenticatedUser,
     payload: CancelOrderRequest,
 ) -> Result<CancelOrderResponse, AuthError> {
-    let wallet = load_wallet_account_context(state, authenticated_user.user_id).await?;
-
+    let wallet = load_order_wallet_context(state, authenticated_user.user_id).await?;
     let existing = crud::get_market_order_by_id_and_user_id(
         &state.db,
         payload.order.order_id,
@@ -181,7 +145,7 @@ pub async fn cancel_existing_order(
     .await?
     .ok_or_else(|| AuthError::not_found("order not found"))?;
 
-    if existing.wallet_address != wallet.wallet_address {
+    if existing.wallet_address != wallet.actor_address {
         return Err(AuthError::forbidden(
             "linked wallet does not match the order maker",
         ));
@@ -222,7 +186,7 @@ pub async fn get_my_orders(
     state: &AppState,
     authenticated_user: AuthenticatedUser,
 ) -> Result<MyOrdersResponse, AuthError> {
-    let wallet = load_wallet_account_context(state, authenticated_user.user_id).await?;
+    let wallet = load_order_wallet_context(state, authenticated_user.user_id).await?;
     let orders = crud::list_market_orders_by_user_id(&state.db, authenticated_user.user_id).await?;
 
     if orders.is_empty() {
@@ -234,11 +198,10 @@ pub async fn get_my_orders(
     }
 
     let market_ids = unique_market_ids(&orders);
+    let event_ids = unique_event_ids(&orders);
     let markets = crud::list_markets_by_ids(&state.db, &market_ids).await?;
     let market_responses = build_market_responses(state, &markets).await?;
-    let event_ids = unique_event_ids(&orders);
     let events = crud::list_market_events_by_ids(&state.db, &event_ids).await?;
-
     let market_records_by_id = markets
         .into_iter()
         .map(|market| (market.id, market))
@@ -252,7 +215,7 @@ pub async fn get_my_orders(
         .map(|event| (event.id, event))
         .collect::<HashMap<_, _>>();
 
-    let orders = orders
+    let items = orders
         .iter()
         .map(|order| {
             let event = events_by_id
@@ -267,7 +230,6 @@ pub async fn get_my_orders(
                 .ok_or_else(|| {
                     AuthError::internal("missing order market response", order.market_id)
                 })?;
-
             build_order_item_response(event, market_record, market, order)
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -275,7 +237,7 @@ pub async fn get_my_orders(
     Ok(MyOrdersResponse {
         wallet_address: wallet.wallet_address,
         account_kind: wallet.account_kind,
-        orders,
+        orders: items,
     })
 }
 
@@ -284,15 +246,6 @@ pub async fn get_my_positions(
     authenticated_user: AuthenticatedUser,
 ) -> Result<MyPositionsResponse, AuthError> {
     let (wallet, snapshots) = load_my_position_snapshots(state, authenticated_user).await?;
-
-    if snapshots.is_empty() {
-        return Ok(MyPositionsResponse {
-            wallet_address: wallet.wallet_address,
-            account_kind: wallet.account_kind,
-            positions: Vec::new(),
-        });
-    }
-
     let positions = snapshots
         .iter()
         .map(|snapshot| {
@@ -317,12 +270,34 @@ pub async fn get_my_portfolio(
     state: &AppState,
     authenticated_user: AuthenticatedUser,
 ) -> Result<MyPortfolioResponse, AuthError> {
-    let wallet = load_wallet_account_context(state, authenticated_user.user_id).await?;
+    let wallet = load_order_wallet_context(state, authenticated_user.user_id).await?;
     let trade_history =
         crud::list_user_trade_history_by_user_id(&state.db, authenticated_user.user_id).await?;
-    let cash_balance = read_usdc_balance(state, &wallet.wallet_address).await?;
+    let cash_balance = parse_stored_amount(
+        &read_usdc_balance(state, &wallet.actor_address).await?,
+        "cash balance",
+    )?;
 
-    if trade_history.is_empty() {
+    let market_ids = trade_history
+        .iter()
+        .map(|record| record.market_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut markets = crud::list_markets_by_ids(&state.db, &market_ids).await?;
+    let snapshots = load_position_snapshots_for_markets(state, &wallet, &markets).await?;
+    for snapshot in &snapshots {
+        if !market_ids.contains(&snapshot.market_record.id) {
+            markets.push(snapshot.market_record.clone());
+        }
+    }
+    let unique_markets = markets
+        .into_iter()
+        .map(|market| (market.id, market))
+        .collect::<HashMap<_, _>>();
+    let markets = unique_markets.into_values().collect::<Vec<_>>();
+
+    if markets.is_empty() {
         return Ok(MyPortfolioResponse {
             wallet_address: wallet.wallet_address,
             account_kind: wallet.account_kind,
@@ -338,13 +313,6 @@ pub async fn get_my_portfolio(
         });
     }
 
-    let market_ids = trade_history
-        .iter()
-        .map(|record| record.market_id)
-        .collect::<BTreeSet<_>>();
-    let market_ids = market_ids.into_iter().collect::<Vec<_>>();
-    let markets = crud::list_markets_by_ids(&state.db, &market_ids).await?;
-    let snapshots = load_position_snapshots_for_markets(state, &wallet, &markets).await?;
     let market_responses = build_market_responses(state, &markets).await?;
     let event_ids = markets
         .iter()
@@ -353,7 +321,6 @@ pub async fn get_my_portfolio(
         .into_iter()
         .collect::<Vec<_>>();
     let events = crud::list_market_events_by_ids(&state.db, &event_ids).await?;
-
     let market_records_by_id = markets
         .into_iter()
         .map(|market| (market.id, market))
@@ -400,10 +367,9 @@ pub async fn get_my_portfolio(
                 &events_by_id,
                 record,
             )?;
-            let usdc_amount = parse_stored_amount(&record.usdc_amount, "stored trade usdc amount")?;
+            let usdc_amount = parse_stored_amount(&record.usdc_amount, "stored trade amount")?;
             let market_state = markets_by_id.entry(record.market_id).or_default();
             update_last_traded_at(&mut market_state.last_traded_at, record.executed_at);
-
             match record.action.as_str() {
                 ORDER_SIDE_BUY => {
                     total_buy_amount += usdc_amount;
@@ -420,7 +386,6 @@ pub async fn get_my_portfolio(
                     ));
                 }
             }
-
             Ok(history_item)
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -434,7 +399,7 @@ pub async fn get_my_portfolio(
             .then_with(|| left_id.cmp(right_id))
     });
 
-    let markets = market_rows
+    let market_rows = market_rows
         .into_iter()
         .map(|(market_id, aggregate)| {
             let market_record = market_records_by_id
@@ -451,7 +416,6 @@ pub async fn get_my_portfolio(
                 .ok_or_else(|| {
                     AuthError::internal("missing portfolio market response", market_id)
                 })?;
-
             Ok::<PortfolioMarketSummaryResponse, AuthError>(PortfolioMarketSummaryResponse {
                 event: EventResponse::from(event),
                 on_chain: EventOnChainResponse::from(event),
@@ -477,7 +441,7 @@ pub async fn get_my_portfolio(
             total_buy_amount: format_amount(&total_buy_amount),
             total_sell_amount: format_amount(&total_sell_amount),
         },
-        markets,
+        markets: market_rows,
         history,
     })
 }
@@ -485,48 +449,28 @@ pub async fn get_my_portfolio(
 async fn load_my_position_snapshots(
     state: &AppState,
     authenticated_user: AuthenticatedUser,
-) -> Result<(WalletAccountContext, Vec<PositionSnapshot>), AuthError> {
-    let wallet = load_wallet_account_context(state, authenticated_user.user_id).await?;
+) -> Result<(OrderWalletContext, Vec<PositionSnapshot>), AuthError> {
+    let wallet = load_order_wallet_context(state, authenticated_user.user_id).await?;
     let markets = crud::list_markets_with_condition_ids(&state.db).await?;
-
     let snapshots = load_position_snapshots_for_markets(state, &wallet, &markets).await?;
-
     Ok((wallet, snapshots))
 }
 
 async fn load_position_snapshots_for_markets(
     state: &AppState,
-    wallet: &WalletAccountContext,
+    wallet: &OrderWalletContext,
     markets: &[MarketRecord],
 ) -> Result<Vec<PositionSnapshot>, AuthError> {
     if markets.is_empty() {
         return Ok(Vec::new());
     }
 
-    let reader = OrderChainReader::new(&state.env)
-        .await
-        .map_err(|error| AuthError::internal("market positions read failed", error))?;
-    let balances_by_market_id = reader
-        .get_market_outcome_balances(&wallet.wallet_address, &markets)
-        .await
-        .map_err(|error| AuthError::internal("market positions read failed", error))?;
-
-    let markets_with_positions = markets
+    let market_responses = build_market_responses(state, markets).await?;
+    let market_responses_by_id = market_responses
         .into_iter()
-        .filter(|market| {
-            balances_by_market_id
-                .get(&market.id)
-                .is_some_and(|(yes, no)| !yes.is_zero() || !no.is_zero())
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-
-    if markets_with_positions.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let market_responses = build_market_responses(state, &markets_with_positions).await?;
-    let event_ids = markets_with_positions
+        .map(|market| (market.id, market))
+        .collect::<HashMap<_, _>>();
+    let event_ids = markets
         .iter()
         .map(|market| market.event_db_id)
         .collect::<BTreeSet<_>>()
@@ -537,41 +481,57 @@ async fn load_position_snapshots_for_markets(
         .into_iter()
         .map(|event| (event.id, event))
         .collect::<HashMap<_, _>>();
-    let market_responses_by_id = market_responses
-        .into_iter()
-        .map(|market| (market.id, market))
-        .collect::<HashMap<_, _>>();
 
-    let snapshots = markets_with_positions
-        .into_iter()
-        .map(|market| {
-            let event = events_by_id
-                .get(&market.event_db_id)
-                .cloned()
-                .ok_or_else(|| AuthError::internal("missing position event", market.event_db_id))?;
-            let market_response =
-                market_responses_by_id
-                    .get(&market.id)
-                    .cloned()
-                    .ok_or_else(|| {
-                        AuthError::internal("missing position market response", market.id)
-                    })?;
-            let (yes_balance, no_balance) = balances_by_market_id
-                .get(&market.id)
-                .cloned()
-                .ok_or_else(|| {
-                    AuthError::internal("missing on-chain position balance", market.id)
-                })?;
+    let mut snapshots = Vec::new();
+    for market in markets {
+        let Some(condition_id) = market.condition_id.as_deref() else {
+            continue;
+        };
 
-            Ok::<PositionSnapshot, AuthError>(PositionSnapshot {
-                event,
-                market_record: market,
-                market_response,
-                yes_balance,
-                no_balance,
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+        let yes_balance = parse_stored_amount(
+            &stellar::get_outcome_position_balance(
+                &state.env,
+                condition_id,
+                &wallet.actor_address,
+                0,
+            )
+            .await
+            .map_err(|error| AuthError::internal("market positions read failed", error))?,
+            "yes balance",
+        )?;
+        let no_balance = parse_stored_amount(
+            &stellar::get_outcome_position_balance(
+                &state.env,
+                condition_id,
+                &wallet.actor_address,
+                1,
+            )
+            .await
+            .map_err(|error| AuthError::internal("market positions read failed", error))?,
+            "no balance",
+        )?;
+
+        if yes_balance.is_zero() && no_balance.is_zero() {
+            continue;
+        }
+
+        let event = events_by_id
+            .get(&market.event_db_id)
+            .cloned()
+            .ok_or_else(|| AuthError::internal("missing position event", market.event_db_id))?;
+        let market_response = market_responses_by_id
+            .get(&market.id)
+            .cloned()
+            .ok_or_else(|| AuthError::internal("missing position market response", market.id))?;
+
+        snapshots.push(PositionSnapshot {
+            event,
+            market_record: market.clone(),
+            market_response,
+            yes_balance,
+            no_balance,
+        });
+    }
 
     Ok(snapshots)
 }
@@ -582,202 +542,50 @@ fn validate_price_bps(price_bps: u32) -> Result<u32, AuthError> {
             "order.price_bps must be between 1 and 10000",
         ));
     }
-
     Ok(price_bps)
 }
 
-fn normalize_expiry(expiry_epoch_seconds: Option<i64>) -> Result<(Option<i64>, U256), AuthError> {
+fn normalize_expiry(expiry_epoch_seconds: Option<i64>) -> Result<(Option<i64>, Option<DateTime<Utc>>), AuthError> {
     match expiry_epoch_seconds {
-        None | Some(0) => Ok((None, U256::zero())),
+        None | Some(0) => Ok((None, None)),
         Some(value) if value <= Utc::now().timestamp() => Err(AuthError::bad_request(
             "order.expiry_epoch_seconds must be in the future",
         )),
         Some(value) => {
-            let expiry =
-                u64::try_from(value).map_err(|_| AuthError::bad_request("invalid order expiry"))?;
-            Ok((Some(value), U256::from(expiry)))
+            let datetime = DateTime::<Utc>::from_timestamp(value, 0)
+                .ok_or_else(|| AuthError::internal("invalid order expiry timestamp", value))?;
+            Ok((Some(value), Some(datetime)))
         }
     }
 }
 
-fn parse_decimal_u256(raw: &str, field_name: &str) -> Result<U256, AuthError> {
+fn normalize_non_empty(raw: &str, field_name: &str) -> Result<String, AuthError> {
     let value = raw.trim();
     if value.is_empty() {
         return Err(AuthError::bad_request(format!("{field_name} is required")));
     }
-
-    U256::from_dec_str(value).map_err(|_| {
-        AuthError::bad_request(format!("{field_name} must be a base-10 integer string",))
-    })
+    Ok(value.to_owned())
 }
 
-fn parse_address(value: &str, field_name: &str) -> Result<Address, AuthError> {
-    Address::from_str(value)
-        .map_err(|_| AuthError::bad_request(format!("{field_name} is not a valid address")))
-}
-
-fn parse_bytes32(value: &str, field_name: &str) -> Result<H256, AuthError> {
-    H256::from_str(value)
-        .map_err(|_| AuthError::bad_request(format!("{field_name} is not a valid bytes32 value")))
-}
-
-fn normalize_signature_hex(signature: &str) -> Result<String, AuthError> {
-    let signature = signature.trim();
-    if signature.is_empty() {
-        return Err(AuthError::bad_request("order.signature is required"));
-    }
-
-    let signature = signature
-        .strip_prefix("0x")
-        .map_or(signature.to_owned(), str::to_owned);
-    if signature.len() != 130
-        || !signature
-            .chars()
-            .all(|character| character.is_ascii_hexdigit())
-    {
-        return Err(AuthError::bad_request(
-            "order.signature must be a 65-byte hex string",
-        ));
-    }
-
-    Ok(format!("0x{signature}"))
-}
-
-async fn verify_order_signature(
-    env: &Environment,
-    wallet: &WalletAccountContext,
-    signature_raw: &str,
-    order_digest: H256,
-    maker: Address,
-) -> Result<(), AuthError> {
-    let signature_hex = normalize_signature_hex(signature_raw)?;
-
-    if wallet.account_kind != ACCOUNT_KIND_SMART_ACCOUNT {
-        return verify_eoa_order_signature(&signature_hex, order_digest, maker);
-    }
-
-    let provider = rpc::monad_provider_arc(env)
-        .await
-        .map_err(|error| AuthError::internal("order signature validation setup failed", error))?;
-    let maker_code = provider
-        .get_code(maker, None)
-        .await
-        .map_err(|error| AuthError::internal("smart-account code lookup failed", error))?;
-
-    if maker_code.as_ref().is_empty() {
-        return Err(AuthError::bad_request(
-            "linked smart-account wallet is not deployed on-chain and cannot place orderbook orders yet",
-        ));
-    }
-
-    let signature_bytes = decode_signature_hex(&signature_hex)?;
-    let validator = Contract::new(maker, erc1271_abi()?, provider);
-    let magic_value = validator
-        .method::<_, [u8; 4]>(
-            "isValidSignature",
-            (order_digest, Bytes::from(signature_bytes)),
-        )
-        .map_err(|error| {
-            AuthError::internal("smart-account signature validation setup failed", error)
-        })?
-        .call()
-        .await
-        .map_err(|_| {
-            AuthError::bad_request(
-                "order.signature is not valid for the linked smart-account wallet",
-            )
-        })?;
-
-    if magic_value != ERC1271_MAGIC_VALUE {
-        return Err(AuthError::bad_request(
-            "order.signature is not valid for the linked smart-account wallet",
-        ));
-    }
-
-    Ok(())
-}
-
-fn verify_eoa_order_signature(
-    signature_hex: &str,
-    order_digest: H256,
-    maker: Address,
-) -> Result<(), AuthError> {
-    let signature = Signature::from_str(signature_hex)
-        .map_err(|_| AuthError::bad_request("order.signature is invalid"))?;
-    let recovered = signature
-        .recover(order_digest)
-        .map_err(|_| AuthError::bad_request("order.signature does not recover a valid signer"))?;
-
-    if recovered != maker {
-        return Err(AuthError::bad_request(
-            "order.signature does not match the linked wallet address",
-        ));
-    }
-
-    Ok(())
-}
-
-fn decode_signature_hex(signature_hex: &str) -> Result<Vec<u8>, AuthError> {
-    hex::decode(signature_hex.trim_start_matches("0x"))
-        .map_err(|_| AuthError::bad_request("order.signature is invalid"))
-}
-
-fn compute_order_hash(
-    maker: Address,
-    condition_id: H256,
+fn compute_order_identity(
+    maker: &str,
+    condition_id: &str,
     outcome_index: i32,
     side: OrderSide,
     price_bps: u32,
-    amount: U256,
-    expiry: U256,
-    salt: U256,
-) -> Result<H256, AuthError> {
-    let outcome_index = u64::try_from(outcome_index)
-        .map_err(|_| AuthError::bad_request("order.outcome_index must be 0 or 1"))?;
-    if outcome_index > 1 {
-        return Err(AuthError::bad_request("order.outcome_index must be 0 or 1"));
-    }
-
-    Ok(H256::from(keccak256(encode(&[
-        Token::FixedBytes(keccak256(ORDER_TYPE).to_vec()),
-        Token::Address(maker),
-        Token::FixedBytes(condition_id.as_bytes().to_vec()),
-        Token::Uint(U256::from(outcome_index)),
-        Token::Uint(U256::from(side.as_u8())),
-        Token::Uint(U256::from(price_bps)),
-        Token::Uint(amount),
-        Token::Uint(expiry),
-        Token::Uint(salt),
-    ]))))
-}
-
-fn compute_order_digest(env: &Environment, order_hash: H256) -> Result<H256, AuthError> {
-    let verifying_contract = parse_address(
-        &env.monad_orderbook_exchange_address,
-        "MONAD_ORDERBOOK_EXCHANGE_ADDRESS",
-    )?;
-    let chain_id = u64::try_from(env.monad_chain_id)
-        .map_err(|_| AuthError::bad_request("MONAD_CHAIN_ID must be non-negative"))?;
-    let domain_separator = H256::from(keccak256(encode(&[
-        Token::FixedBytes(keccak256(ORDER_DOMAIN_TYPE).to_vec()),
-        Token::FixedBytes(keccak256(ORDER_DOMAIN_NAME).to_vec()),
-        Token::FixedBytes(keccak256(ORDER_DOMAIN_VERSION).to_vec()),
-        Token::Uint(U256::from(chain_id)),
-        Token::Address(verifying_contract),
-    ])));
-
-    let mut encoded = Vec::with_capacity(66);
-    encoded.extend_from_slice(b"\x19\x01");
-    encoded.extend_from_slice(domain_separator.as_bytes());
-    encoded.extend_from_slice(order_hash.as_bytes());
-
-    Ok(H256::from(keccak256(encoded)))
-}
-
-fn erc1271_abi() -> Result<Abi, AuthError> {
-    AbiParser::default()
-        .parse(&["function isValidSignature(bytes32 hash, bytes signature) view returns (bytes4 magicValue)"])
-        .map_err(|error| AuthError::internal("failed to build ERC-1271 ABI", error))
+    amount: &str,
+    expiry_epoch_seconds: Option<i64>,
+    salt: &str,
+) -> (String, String) {
+    let hash_input = format!(
+        "{maker}|{condition_id}|{outcome_index}|{}|{price_bps}|{amount}|{}|{salt}",
+        side.as_str(),
+        expiry_epoch_seconds.unwrap_or_default()
+    );
+    let order_hash = hex::encode(keccak256(hash_input.as_bytes()));
+    let digest_input = format!("sabi-stellar-order|{order_hash}");
+    let order_digest = hex::encode(keccak256(digest_input.as_bytes()));
+    (order_hash, order_digest)
 }
 
 fn build_order_item_response(
@@ -789,9 +597,9 @@ fn build_order_item_response(
     let price_bps = u32::try_from(record.price_bps)
         .map_err(|error| AuthError::internal("invalid order price", error))?;
     let amount = parse_stored_amount(&record.amount, "stored order amount")?;
-    let filled_amount = parse_stored_amount(&record.filled_amount, "stored filled order amount")?;
+    let filled_amount = parse_stored_amount(&record.filled_amount, "stored filled amount")?;
     let remaining_amount =
-        parse_stored_amount(&record.remaining_amount, "stored remaining order amount")?;
+        parse_stored_amount(&record.remaining_amount, "stored remaining amount")?;
     let quoted_usdc_amount = quote_usdc_amount(amount, price_bps);
     let expires_at = expiry_datetime(record.expiry_epoch_seconds)?;
 
@@ -899,8 +707,8 @@ fn build_portfolio_trade_history_item_response(
         .ok_or_else(|| AuthError::internal("missing portfolio trade event", record.event_id))?;
     let price_bps = u32::try_from(record.price_bps)
         .map_err(|error| AuthError::internal("invalid stored trade price", error))?;
-    let usdc_amount = parse_stored_amount(&record.usdc_amount, "stored trade usdc amount")?;
-    let token_amount = parse_stored_amount(&record.token_amount, "stored trade token amount")?;
+    let usdc_amount = parse_stored_amount(&record.usdc_amount, "stored usdc amount")?;
+    let token_amount = parse_stored_amount(&record.token_amount, "stored token amount")?;
 
     Ok(PortfolioTradeHistoryItemResponse {
         id: record.history_key.clone(),
@@ -949,8 +757,34 @@ async fn load_order_market_and_event(
     let event = market_crud::get_market_event_by_id(&state.db, market.event_db_id)
         .await?
         .ok_or_else(|| AuthError::not_found("event not found"))?;
-
     Ok((event, market))
+}
+
+async fn load_order_wallet_context(
+    state: &AppState,
+    user_id: Uuid,
+) -> Result<OrderWalletContext, AuthError> {
+    let wallet = auth_crud::get_wallet_for_user(&state.db, user_id)
+        .await?
+        .ok_or_else(|| AuthError::unauthorized("wallet not linked to user"))?;
+    let deployed_wallet_address = wallet
+        .wallet_address
+        .ok_or_else(|| AuthError::forbidden("wallet is not deployed"))?;
+    let actor_address = wallet
+        .owner_address
+        .clone()
+        .unwrap_or_else(|| deployed_wallet_address.clone());
+    let account_kind = if wallet.account_kind == ACCOUNT_KIND_STELLAR_SMART_WALLET {
+        "smart_account".to_owned()
+    } else {
+        wallet.account_kind
+    };
+
+    Ok(OrderWalletContext {
+        wallet_address: actor_address.clone(),
+        account_kind,
+        actor_address,
+    })
 }
 
 fn unique_market_ids(orders: &[MarketOrderRecord]) -> Vec<Uuid> {
@@ -991,7 +825,7 @@ fn unique_constraint(error: &sqlx::Error) -> Option<&str> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 enum OrderSide {
     Buy,
     Sell,
@@ -1012,294 +846,4 @@ impl OrderSide {
             Self::Sell => ORDER_SIDE_SELL,
         }
     }
-
-    fn as_u8(self) -> u8 {
-        match self {
-            Self::Buy => 0,
-            Self::Sell => 1,
-        }
-    }
-}
-
-#[derive(Clone)]
-struct OrderChainReader {
-    conditional_tokens: Contract<ReadProvider>,
-    collateral_token: Address,
-}
-
-impl OrderChainReader {
-    async fn new(env: &Environment) -> Result<Self> {
-        let provider = rpc::monad_provider_arc(env).await?;
-        let conditional_tokens = Contract::new(
-            parse_address(
-                &env.monad_conditional_tokens_address,
-                "MONAD_CONDITIONAL_TOKENS_ADDRESS",
-            )
-            .map_err(|error| anyhow!(error.to_string()))?,
-            conditional_tokens_read_abi()?,
-            provider,
-        );
-        let collateral_token = parse_address(&env.monad_usdc_address, "MONAD_USDC_ADDRESS")
-            .map_err(|error| anyhow!(error.to_string()))?;
-
-        Ok(Self {
-            conditional_tokens,
-            collateral_token,
-        })
-    }
-
-    async fn get_market_outcome_balances(
-        &self,
-        wallet_address: &str,
-        markets: &[MarketRecord],
-    ) -> Result<HashMap<Uuid, (U256, U256)>> {
-        let wallet = Address::from_str(wallet_address).context("invalid wallet address")?;
-        let position_ids = self.load_market_position_ids(markets).await?;
-
-        if position_ids.is_empty() {
-            return Ok(HashMap::new());
-        }
-
-        self.load_market_balances(wallet_address, wallet, &position_ids)
-            .await
-    }
-
-    async fn load_market_position_ids(
-        &self,
-        markets: &[MarketRecord],
-    ) -> Result<Vec<MarketPositionIds>> {
-        let mut join_set = JoinSet::new();
-        let mut next_market_index = 0_usize;
-
-        while next_market_index < markets.len() && join_set.len() < MAX_CONCURRENT_POSITION_ID_READS
-        {
-            let reader = self.clone();
-            let market = markets[next_market_index].clone();
-            next_market_index += 1;
-            join_set.spawn(async move {
-                let market_id = market.id;
-                let result = reader.get_market_position_ids(&market).await;
-                (market_id, result)
-            });
-        }
-
-        let mut position_ids = Vec::with_capacity(markets.len());
-        let mut first_error = None;
-        while let Some(result) = join_set.join_next().await {
-            let (market_id, position_result) =
-                result.context("market position id task join failed")?;
-
-            match position_result {
-                Ok(position) => position_ids.push(position),
-                Err(error) => {
-                    tracing::warn!(
-                        %market_id,
-                        error = %error,
-                        "skipping market during conditional token position id read"
-                    );
-                    if first_error.is_none() {
-                        first_error = Some(
-                            error.context(format!("market {market_id} position id read failed")),
-                        );
-                    }
-                }
-            }
-
-            if next_market_index < markets.len() {
-                let reader = self.clone();
-                let market = markets[next_market_index].clone();
-                next_market_index += 1;
-                join_set.spawn(async move {
-                    let market_id = market.id;
-                    let result = reader.get_market_position_ids(&market).await;
-                    (market_id, result)
-                });
-            }
-        }
-
-        if position_ids.is_empty() && !markets.is_empty() {
-            return Err(first_error
-                .unwrap_or_else(|| anyhow!("failed to compute conditional token position ids")));
-        }
-
-        Ok(position_ids)
-    }
-
-    async fn get_market_position_ids(&self, market: &MarketRecord) -> Result<MarketPositionIds> {
-        let condition_id = market
-            .condition_id
-            .as_deref()
-            .ok_or_else(|| anyhow!("market {} is missing a condition id", market.id))?;
-        let condition_id = H256::from_str(condition_id).context("invalid condition id")?;
-
-        let yes_collection = self
-            .conditional_tokens
-            .method::<_, H256>(
-                "getCollectionId",
-                (H256::zero(), condition_id, U256::from(1_u64)),
-            )?
-            .call()
-            .await
-            .context("failed to compute YES collection id")?;
-        let no_collection = self
-            .conditional_tokens
-            .method::<_, H256>(
-                "getCollectionId",
-                (H256::zero(), condition_id, U256::from(2_u64)),
-            )?
-            .call()
-            .await
-            .context("failed to compute NO collection id")?;
-
-        let yes_position_id = self
-            .conditional_tokens
-            .method::<_, U256>("getPositionId", (self.collateral_token, yes_collection))?
-            .call()
-            .await
-            .context("failed to compute YES position id")?;
-        let no_position_id = self
-            .conditional_tokens
-            .method::<_, U256>("getPositionId", (self.collateral_token, no_collection))?
-            .call()
-            .await
-            .context("failed to compute NO position id")?;
-
-        Ok(MarketPositionIds {
-            market_id: market.id,
-            yes_position_id,
-            no_position_id,
-        })
-    }
-
-    async fn load_market_balances(
-        &self,
-        wallet_address: &str,
-        wallet: Address,
-        position_ids: &[MarketPositionIds],
-    ) -> Result<HashMap<Uuid, (U256, U256)>> {
-        let mut balances_by_market_id = HashMap::with_capacity(position_ids.len());
-        let mut first_error = None;
-
-        for chunk in position_ids.chunks(MARKET_BALANCE_BATCH_SIZE) {
-            match self.read_market_balance_chunk(wallet, chunk).await {
-                Ok(chunk_balances) => {
-                    balances_by_market_id.extend(chunk_balances);
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        %wallet_address,
-                        market_count = chunk.len(),
-                        error = %error,
-                        "conditional token batch balance read failed; retrying per market"
-                    );
-                    if first_error.is_none() {
-                        first_error =
-                            Some(error.context("conditional token batch balance read failed"));
-                    }
-
-                    for position in chunk {
-                        match self.read_single_market_balances(wallet, position).await {
-                            Ok((yes_balance, no_balance)) => {
-                                balances_by_market_id
-                                    .insert(position.market_id, (yes_balance, no_balance));
-                            }
-                            Err(error) => {
-                                tracing::warn!(
-                                    %wallet_address,
-                                    market_id = %position.market_id,
-                                    error = %error,
-                                    "skipping market during conditional token balance read"
-                                );
-                                if first_error.is_none() {
-                                    first_error = Some(error.context(format!(
-                                        "conditional token balance read failed for market {}",
-                                        position.market_id
-                                    )));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if balances_by_market_id.is_empty() && !position_ids.is_empty() {
-            return Err(first_error
-                .unwrap_or_else(|| anyhow!("failed to query conditional token balances")));
-        }
-
-        Ok(balances_by_market_id)
-    }
-
-    async fn read_market_balance_chunk(
-        &self,
-        wallet: Address,
-        position_ids: &[MarketPositionIds],
-    ) -> Result<HashMap<Uuid, (U256, U256)>> {
-        let mut token_ids = Vec::with_capacity(position_ids.len() * 2);
-        let mut offsets = Vec::with_capacity(position_ids.len());
-
-        for position in position_ids {
-            let yes_index = token_ids.len();
-            token_ids.push(position.yes_position_id);
-            let no_index = token_ids.len();
-            token_ids.push(position.no_position_id);
-            offsets.push((position.market_id, yes_index, no_index));
-        }
-
-        let accounts = vec![wallet; token_ids.len()];
-        let balances = self
-            .conditional_tokens
-            .method::<_, Vec<U256>>("balanceOfBatch", (accounts, token_ids))?
-            .call()
-            .await
-            .context("failed to query conditional token balances")?;
-
-        let mut balances_by_market_id = HashMap::with_capacity(position_ids.len());
-        for (market_id, yes_index, no_index) in offsets {
-            let yes_balance = balances
-                .get(yes_index)
-                .copied()
-                .ok_or_else(|| anyhow!("missing YES balance entry"))?;
-            let no_balance = balances
-                .get(no_index)
-                .copied()
-                .ok_or_else(|| anyhow!("missing NO balance entry"))?;
-            balances_by_market_id.insert(market_id, (yes_balance, no_balance));
-        }
-
-        Ok(balances_by_market_id)
-    }
-
-    async fn read_single_market_balances(
-        &self,
-        wallet: Address,
-        position: &MarketPositionIds,
-    ) -> Result<(U256, U256)> {
-        let yes_balance = self
-            .conditional_tokens
-            .method::<_, U256>("balanceOf", (wallet, position.yes_position_id))?
-            .call()
-            .await
-            .context("failed to query YES conditional token balance")?;
-        let no_balance = self
-            .conditional_tokens
-            .method::<_, U256>("balanceOf", (wallet, position.no_position_id))?
-            .call()
-            .await
-            .context("failed to query NO conditional token balance")?;
-
-        Ok((yes_balance, no_balance))
-    }
-}
-
-fn conditional_tokens_read_abi() -> Result<Abi> {
-    AbiParser::default()
-        .parse(&[
-            "function getCollectionId(bytes32 parentCollectionId, bytes32 conditionId, uint256 indexSet) view returns (bytes32)",
-            "function getPositionId(address collateralToken, bytes32 collectionId) view returns (uint256)",
-            "function balanceOf(address account, uint256 id) view returns (uint256)",
-            "function balanceOfBatch(address[] accounts, uint256[] ids) view returns (uint256[])",
-        ])
-        .map_err(Into::into)
 }

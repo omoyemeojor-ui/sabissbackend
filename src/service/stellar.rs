@@ -1,8 +1,10 @@
 use std::process::Stdio;
 
 use anyhow::{Context, Result, anyhow};
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use tokio::process::Command;
+use tokio::time::{Duration, sleep};
 
 use crate::config::environment::Environment;
 
@@ -67,6 +69,18 @@ pub struct MarketLiquidityReadResult {
 pub struct MarketPricesReadResult {
     pub yes_bps: u32,
     pub no_bps: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct LiquidityPositionReadResult {
+    pub posted_yes_amount: String,
+    pub posted_no_amount: String,
+    pub idle_yes_amount: String,
+    pub idle_no_amount: String,
+    pub collateral_amount: String,
+    pub claimable_collateral_amount: String,
+    pub updated_at: Option<DateTime<Utc>>,
+    pub active: bool,
 }
 
 const DEFAULT_RESOLUTION_DISPUTE_WINDOW_SECONDS: i64 = 86_400;
@@ -351,6 +365,9 @@ pub async fn buy_market_outcome(
     outcome_index: u32,
     usdc_amount: &str,
 ) -> Result<ContractTxResult> {
+    ensure_exchange_max_trade_amount(env, usdc_amount)
+        .await
+        .context("failed to raise Soroban exchange max trade amount for buy")?;
     let condition_id = bytes32_cli_arg(condition_id)?;
     invoke_contract_as_source(
         env,
@@ -492,7 +509,7 @@ pub async fn set_market_prices(
     no_bps: u32,
 ) -> Result<SetMarketPricesTxResult> {
     let condition_id = bytes32_cli_arg(condition_id)?;
-    invoke_contract(
+    match invoke_contract(
         env,
         &env.sabi_exchange_id,
         true,
@@ -507,8 +524,18 @@ pub async fn set_market_prices(
         ],
     )
     .await
-    .context("failed to set YES market price on Soroban")?;
-    invoke_contract(
+    {
+        Ok(_) => {}
+        Err(error) if is_retryable_submission_error(&error) => {
+            sleep(Duration::from_millis(1_500)).await;
+            let refreshed = get_market_price_bps(env, condition_id.as_str(), 0).await?;
+            if refreshed != yes_bps {
+                return Err(error).context("failed to set YES market price on Soroban");
+            }
+        }
+        Err(error) => return Err(error).context("failed to set YES market price on Soroban"),
+    }
+    match invoke_contract(
         env,
         &env.sabi_exchange_id,
         true,
@@ -523,7 +550,17 @@ pub async fn set_market_prices(
         ],
     )
     .await
-    .context("failed to set NO market price on Soroban")?;
+    {
+        Ok(_) => {}
+        Err(error) if is_retryable_submission_error(&error) => {
+            sleep(Duration::from_millis(1_500)).await;
+            let refreshed = get_market_price_bps(env, condition_id.as_str(), 1).await?;
+            if refreshed != no_bps {
+                return Err(error).context("failed to set NO market price on Soroban");
+            }
+        }
+        Err(error) => return Err(error).context("failed to set NO market price on Soroban"),
+    }
 
     Ok(SetMarketPricesTxResult {
         yes_price_tx_hash: STELLAR_PLACEHOLDER_TX_HASH.to_owned(),
@@ -544,22 +581,67 @@ pub async fn bootstrap_market_liquidity(
 
     invoke_contract(
         env,
-        &env.sabi_liquidity_manager_id,
+        &env.sabi_ctf_id,
         true,
         &[
-            "split_and_add_liquidity",
-            "--provider",
+            "split_position",
+            "--user",
             &env.admin,
+            "--collateral-token",
+            &env.mock_usdc_id,
+            "--parent-collection-id",
+            "0000000000000000000000000000000000000000000000000000000000000000",
             "--condition-id",
             condition_id.as_str(),
             "--amount",
             inventory_usdc_amount,
+            "--partition",
+            "[1,2]",
         ],
     )
     .await
-    .context("failed to split and add liquidity on Soroban")?;
+    .context("failed to split bootstrap collateral on Soroban")?;
+    invoke_contract(
+        env,
+        &env.sabi_liquidity_manager_id,
+        true,
+        &[
+            "deposit_inventory",
+            "--provider",
+            &env.admin,
+            "--condition-id",
+            condition_id.as_str(),
+            "--yes-amount",
+            inventory_usdc_amount,
+            "--no-amount",
+            inventory_usdc_amount,
+        ],
+    )
+    .await
+    .context("failed to deposit bootstrap inventory through Soroban liquidity manager")?;
+    invoke_contract(
+        env,
+        &env.sabi_liquidity_manager_id,
+        true,
+        &[
+            "add_liquidity",
+            "--provider",
+            &env.admin,
+            "--condition-id",
+            condition_id.as_str(),
+            "--yes-amount",
+            inventory_usdc_amount,
+            "--no-amount",
+            inventory_usdc_amount,
+        ],
+    )
+    .await
+    .context("failed to post bootstrap liquidity on Soroban")?;
 
     let deposit_collateral_tx_hash = if exit_collateral_usdc_amount != "0" {
+        ensure_exchange_max_trade_amount(env, exit_collateral_usdc_amount)
+            .await
+            .context("failed to raise Soroban exchange max trade amount for collateral bootstrap")?;
         invoke_contract(
             env,
             &env.sabi_liquidity_manager_id,
@@ -641,12 +723,477 @@ pub async fn get_market_liquidity(
     Ok(MarketLiquidityReadResult {
         yes_available,
         no_available,
-        idle_yes_total: "0".to_owned(),
-        idle_no_total: "0".to_owned(),
+        idle_yes_total: totals.idle_yes_total,
+        idle_no_total: totals.idle_no_total,
         posted_yes_total: totals.posted_yes_total,
         posted_no_total: totals.posted_no_total,
         claimable_collateral_total: totals.claimable_collateral_total,
     })
+}
+
+pub async fn get_event_liquidity(
+    env: &Environment,
+    event_id: &str,
+) -> Result<MarketLiquidityReadResult> {
+    let event_id = bytes32_cli_arg(event_id)?;
+    let totals = invoke_contract(
+        env,
+        &env.sabi_liquidity_manager_id,
+        false,
+        &["get_event_liquidity", "--event-id", event_id.as_str()],
+    )
+    .await
+    .context("failed to read event liquidity totals on Soroban liquidity manager")?;
+    let totals = parse_liquidity_totals(&totals)?;
+
+    Ok(MarketLiquidityReadResult {
+        yes_available: totals.posted_yes_total.clone(),
+        no_available: totals.posted_no_total.clone(),
+        idle_yes_total: totals.idle_yes_total,
+        idle_no_total: totals.idle_no_total,
+        posted_yes_total: totals.posted_yes_total,
+        posted_no_total: totals.posted_no_total,
+        claimable_collateral_total: totals.claimable_collateral_total,
+    })
+}
+
+pub async fn get_liquidity_position(
+    env: &Environment,
+    condition_id: &str,
+    provider: &str,
+) -> Result<LiquidityPositionReadResult> {
+    let condition_id = bytes32_cli_arg(condition_id)?;
+    let position = invoke_contract(
+        env,
+        &env.sabi_liquidity_manager_id,
+        false,
+        &[
+            "get_liquidity_position",
+            "--condition-id",
+            condition_id.as_str(),
+            "--provider",
+            provider,
+        ],
+    )
+    .await
+    .context("failed to read liquidity position on Soroban liquidity manager")?;
+
+    parse_liquidity_position(&position)
+}
+
+pub async fn deposit_inventory(
+    env: &Environment,
+    source_account: &str,
+    provider: &str,
+    condition_id: &str,
+    yes_amount: &str,
+    no_amount: &str,
+) -> Result<ContractTxResult> {
+    let condition_id = bytes32_cli_arg(condition_id)?;
+    invoke_contract_as_source(
+        env,
+        source_account,
+        &env.sabi_liquidity_manager_id,
+        true,
+        &[
+            "deposit_inventory",
+            "--provider",
+            provider,
+            "--condition-id",
+            condition_id.as_str(),
+            "--yes-amount",
+            yes_amount,
+            "--no-amount",
+            no_amount,
+        ],
+    )
+    .await
+    .context("failed to deposit inventory through Soroban liquidity manager")?;
+
+    Ok(ContractTxResult {
+        tx_hash: STELLAR_PLACEHOLDER_TX_HASH.to_owned(),
+    })
+}
+
+pub async fn add_liquidity(
+    env: &Environment,
+    source_account: &str,
+    provider: &str,
+    condition_id: &str,
+    yes_amount: &str,
+    no_amount: &str,
+) -> Result<ContractTxResult> {
+    let condition_id = bytes32_cli_arg(condition_id)?;
+    invoke_contract_as_source(
+        env,
+        source_account,
+        &env.sabi_liquidity_manager_id,
+        true,
+        &[
+            "add_liquidity",
+            "--provider",
+            provider,
+            "--condition-id",
+            condition_id.as_str(),
+            "--yes-amount",
+            yes_amount,
+            "--no-amount",
+            no_amount,
+        ],
+    )
+    .await
+    .context("failed to add liquidity through Soroban liquidity manager")?;
+
+    Ok(ContractTxResult {
+        tx_hash: STELLAR_PLACEHOLDER_TX_HASH.to_owned(),
+    })
+}
+
+pub async fn deposit_collateral(
+    env: &Environment,
+    source_account: &str,
+    provider: &str,
+    condition_id: &str,
+    amount: &str,
+) -> Result<ContractTxResult> {
+    ensure_exchange_max_trade_amount(env, amount)
+        .await
+        .context("failed to raise Soroban exchange max trade amount for collateral deposit")?;
+    let condition_id = bytes32_cli_arg(condition_id)?;
+    invoke_contract_as_source(
+        env,
+        source_account,
+        &env.sabi_liquidity_manager_id,
+        true,
+        &[
+            "deposit_collateral",
+            "--provider",
+            provider,
+            "--condition-id",
+            condition_id.as_str(),
+            "--amount",
+            amount,
+        ],
+    )
+    .await
+    .context("failed to deposit collateral through Soroban liquidity manager")?;
+
+    Ok(ContractTxResult {
+        tx_hash: STELLAR_PLACEHOLDER_TX_HASH.to_owned(),
+    })
+}
+
+pub async fn remove_liquidity(
+    env: &Environment,
+    source_account: &str,
+    provider: &str,
+    condition_id: &str,
+    yes_amount: &str,
+    no_amount: &str,
+) -> Result<ContractTxResult> {
+    let condition_id = bytes32_cli_arg(condition_id)?;
+    invoke_contract_as_source(
+        env,
+        source_account,
+        &env.sabi_liquidity_manager_id,
+        true,
+        &[
+            "remove_liquidity",
+            "--provider",
+            provider,
+            "--condition-id",
+            condition_id.as_str(),
+            "--yes-amount",
+            yes_amount,
+            "--no-amount",
+            no_amount,
+        ],
+    )
+    .await
+    .context("failed to remove liquidity through Soroban liquidity manager")?;
+
+    Ok(ContractTxResult {
+        tx_hash: STELLAR_PLACEHOLDER_TX_HASH.to_owned(),
+    })
+}
+
+pub async fn withdraw_inventory(
+    env: &Environment,
+    source_account: &str,
+    provider: &str,
+    condition_id: &str,
+    yes_amount: &str,
+    no_amount: &str,
+    recipient: &str,
+) -> Result<ContractTxResult> {
+    let condition_id = bytes32_cli_arg(condition_id)?;
+    invoke_contract_as_source(
+        env,
+        source_account,
+        &env.sabi_liquidity_manager_id,
+        true,
+        &[
+            "withdraw_inventory",
+            "--provider",
+            provider,
+            "--condition-id",
+            condition_id.as_str(),
+            "--yes-amount",
+            yes_amount,
+            "--no-amount",
+            no_amount,
+            "--recipient",
+            recipient,
+        ],
+    )
+    .await
+    .context("failed to withdraw inventory through Soroban liquidity manager")?;
+
+    Ok(ContractTxResult {
+        tx_hash: STELLAR_PLACEHOLDER_TX_HASH.to_owned(),
+    })
+}
+
+pub async fn withdraw_collateral(
+    env: &Environment,
+    source_account: &str,
+    provider: &str,
+    condition_id: &str,
+    amount: &str,
+    recipient: &str,
+) -> Result<ContractTxResult> {
+    ensure_exchange_max_trade_amount(env, amount)
+        .await
+        .context("failed to raise Soroban exchange max trade amount for collateral withdrawal")?;
+    let condition_id = bytes32_cli_arg(condition_id)?;
+    invoke_contract_as_source(
+        env,
+        source_account,
+        &env.sabi_liquidity_manager_id,
+        true,
+        &[
+            "withdraw_collateral",
+            "--provider",
+            provider,
+            "--condition-id",
+            condition_id.as_str(),
+            "--amount",
+            amount,
+            "--recipient",
+            recipient,
+        ],
+    )
+    .await
+    .context("failed to withdraw collateral through Soroban liquidity manager")?;
+
+    Ok(ContractTxResult {
+        tx_hash: STELLAR_PLACEHOLDER_TX_HASH.to_owned(),
+    })
+}
+
+pub async fn mint_mock_usdc(
+    env: &Environment,
+    recipient: &str,
+    amount: &str,
+) -> Result<ContractTxResult> {
+    invoke_contract(
+        env,
+        &env.mock_usdc_id,
+        true,
+        &["mint", "--to", recipient, "--amount", amount],
+    )
+    .await
+    .context("failed to mint Mock USDC on Soroban")?;
+
+    Ok(ContractTxResult {
+        tx_hash: STELLAR_PLACEHOLDER_TX_HASH.to_owned(),
+    })
+}
+
+pub async fn get_mock_usdc_balance(env: &Environment, address: &str) -> Result<String> {
+    invoke_contract(env, &env.mock_usdc_id, false, &["balance", "--id", address])
+        .await
+        .context("failed to read Mock USDC balance on Soroban")
+}
+
+pub async fn get_exchange_max_trade_amount(env: &Environment) -> Result<String> {
+    invoke_contract(env, &env.sabi_exchange_id, false, &["get_max_trade_amount"])
+        .await
+        .context("failed to read Soroban exchange max trade amount")
+}
+
+pub async fn get_market_price_bps(
+    env: &Environment,
+    condition_id: &str,
+    outcome_index: u32,
+) -> Result<u32> {
+    let condition_id = bytes32_cli_arg(condition_id)?;
+    let raw = invoke_contract(
+        env,
+        &env.sabi_exchange_id,
+        false,
+        &[
+            "get_price",
+            "--condition-id",
+            condition_id.as_str(),
+            "--outcome-index",
+            &outcome_index.to_string(),
+        ],
+    )
+    .await
+    .context("failed to read Soroban market price")?;
+
+    raw.parse::<u32>()
+        .with_context(|| format!("invalid Soroban market price `{raw}`"))
+}
+
+pub async fn set_exchange_max_trade_amount(
+    env: &Environment,
+    amount: &str,
+) -> Result<ContractTxResult> {
+    invoke_contract(
+        env,
+        &env.sabi_exchange_id,
+        true,
+        &["set_max_trade_amount", "--amount", amount],
+    )
+    .await
+    .context("failed to set Soroban exchange max trade amount")?;
+
+    Ok(ContractTxResult {
+        tx_hash: STELLAR_PLACEHOLDER_TX_HASH.to_owned(),
+    })
+}
+
+pub async fn ensure_exchange_max_trade_amount(
+    env: &Environment,
+    minimum_amount: &str,
+) -> Result<()> {
+    let required = minimum_amount
+        .parse::<u128>()
+        .with_context(|| format!("invalid minimum exchange max trade amount `{minimum_amount}`"))?;
+    if required == 0 {
+        return Ok(());
+    }
+
+    let existing = get_exchange_max_trade_amount(env)
+        .await?
+        .parse::<u128>()
+        .context("invalid Soroban exchange max trade amount")?;
+    if existing >= required {
+        return Ok(());
+    }
+
+    set_exchange_max_trade_amount(env, &required.to_string())
+        .await
+        .context("failed to raise Soroban exchange max trade amount")?;
+    Ok(())
+}
+
+pub async fn ensure_mock_usdc_balance(
+    env: &Environment,
+    address: &str,
+    minimum_amount: &str,
+) -> Result<()> {
+    if env.network != "testnet" {
+        return Ok(());
+    }
+
+    let required = minimum_amount
+        .parse::<u128>()
+        .with_context(|| format!("invalid minimum mock USDC amount `{minimum_amount}`"))?;
+    if required == 0 {
+        return Ok(());
+    }
+
+    let existing = get_mock_usdc_balance(env, address)
+        .await?
+        .parse::<u128>()
+        .with_context(|| format!("invalid mock USDC balance for `{address}`"))?;
+    if existing >= required {
+        return Ok(());
+    }
+
+    let missing = required - existing;
+    match mint_mock_usdc(env, address, &missing.to_string()).await {
+        Ok(_) => {}
+        Err(error) if is_retryable_submission_error(&error) => {
+            sleep(Duration::from_millis(1_500)).await;
+            let refreshed = get_mock_usdc_balance(env, address)
+                .await?
+                .parse::<u128>()
+                .with_context(|| format!("invalid mock USDC balance for `{address}`"))?;
+            if refreshed < required {
+                return Err(error)
+                    .with_context(|| format!("failed to top up mock USDC for `{address}`"));
+            }
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to top up mock USDC for `{address}`"));
+        }
+    }
+    Ok(())
+}
+
+fn is_retryable_submission_error(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    message.contains("transaction submission timeout")
+        || message.contains("txbadseq")
+        || message.contains("bad seq")
+}
+
+pub async fn get_outcome_position_balance(
+    env: &Environment,
+    condition_id: &str,
+    holder: &str,
+    outcome_index: u32,
+) -> Result<String> {
+    let condition_id = bytes32_cli_arg(condition_id)?;
+    let collection_id = invoke_contract(
+        env,
+        &env.sabi_ctf_id,
+        false,
+        &[
+            "get_collection_id",
+            "--parent-collection-id",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "--condition-id",
+            condition_id.as_str(),
+            "--index-set",
+            &(1u32 << outcome_index).to_string(),
+        ],
+    )
+    .await
+    .context("failed to derive CTF collection id")?;
+    let position_id = invoke_contract(
+        env,
+        &env.sabi_ctf_id,
+        false,
+        &[
+            "get_position_id",
+            "--collateral-token",
+            &env.mock_usdc_id,
+            "--collection-id",
+            collection_id.as_str(),
+        ],
+    )
+    .await
+    .context("failed to derive CTF position id")?;
+
+    invoke_contract(
+        env,
+        &env.sabi_ctf_id,
+        false,
+        &[
+            "get_position_balance",
+            "--user",
+            holder,
+            "--position-id",
+            position_id.as_str(),
+        ],
+    )
+    .await
+    .context("failed to read CTF position balance")
 }
 
 pub async fn get_market_prices_batch_best_effort(
@@ -769,6 +1316,159 @@ async fn invoke_contract_as_source(
     Ok(parse_invoke_output(stdout))
 }
 
+pub async fn build_contract_invocation_xdr(
+    env: &Environment,
+    source_account: &str,
+    contract_id: &str,
+    contract_args: &[&str],
+) -> Result<String> {
+    let mut command = Command::new("stellar");
+    command
+        .arg("contract")
+        .arg("invoke")
+        .arg("--network")
+        .arg(&env.network)
+        .arg("--source-account")
+        .arg(source_account)
+        .arg("--id")
+        .arg(contract_id)
+        .arg("--build-only")
+        .arg("--")
+        .args(contract_args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let output = command
+        .output()
+        .await
+        .with_context(|| format!("failed to build XDR for `{contract_id}`"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        let detail = if !stderr.is_empty() { stderr } else { stdout };
+        return Err(anyhow!("stellar contract build failed: {detail}"));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+pub async fn sign_transaction_xdr(
+    env: &Environment,
+    xdr: &str,
+    secret_key: &str,
+) -> Result<String> {
+    let mut command = Command::new("stellar");
+    command
+        .arg("tx")
+        .arg("sign")
+        .arg("--network")
+        .arg(&env.network)
+        .arg("--sign-with-key")
+        .arg(secret_key)
+        .arg(xdr)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let output = command
+        .output()
+        .await
+        .context("failed to execute `stellar tx sign`")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        let detail = if !stderr.is_empty() { stderr } else { stdout };
+        return Err(anyhow!("stellar tx sign failed: {detail}"));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+pub async fn hash_transaction_xdr(env: &Environment, xdr: &str) -> Result<String> {
+    let mut command = Command::new("stellar");
+    command
+        .arg("tx")
+        .arg("hash")
+        .arg("--network")
+        .arg(&env.network)
+        .arg(xdr)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let output = command
+        .output()
+        .await
+        .context("failed to execute `stellar tx hash`")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        let detail = if !stderr.is_empty() { stderr } else { stdout };
+        return Err(anyhow!("stellar tx hash failed: {detail}"));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+pub async fn send_transaction_xdr(env: &Environment, xdr: &str) -> Result<String> {
+    let mut command = Command::new("stellar");
+    command
+        .arg("tx")
+        .arg("send")
+        .arg("--network")
+        .arg(&env.network)
+        .arg(xdr)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let output = command
+        .output()
+        .await
+        .context("failed to execute `stellar tx send`")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        let detail = if !stderr.is_empty() { stderr } else { stdout };
+        return Err(anyhow!("stellar tx send failed: {detail}"));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+pub async fn invoke_contract_with_sponsor(
+    env: &Environment,
+    user_signing_key: &str,
+    contract_id: &str,
+    contract_args: &[&str],
+) -> Result<ContractTxResult> {
+    let sponsor_signing_key = env
+        .private_key
+        .as_deref()
+        .ok_or_else(|| anyhow!("PRIVATE_KEY is required for sponsored submissions"))?;
+    let unsigned_xdr =
+        build_contract_invocation_xdr(env, sponsor_signing_key, contract_id, contract_args)
+            .await
+            .with_context(|| {
+                format!("failed to build sponsored invocation XDR for `{contract_id}`")
+            })?;
+    let user_signed_xdr = sign_transaction_xdr(env, &unsigned_xdr, user_signing_key)
+        .await
+        .context("failed to sign sponsored transaction with user key")?;
+    let fully_signed_xdr = sign_transaction_xdr(env, &user_signed_xdr, sponsor_signing_key)
+        .await
+        .context("failed to sign sponsored transaction with sponsor key")?;
+    let tx_hash = hash_transaction_xdr(env, &fully_signed_xdr)
+        .await
+        .unwrap_or_else(|_| STELLAR_PLACEHOLDER_TX_HASH.to_owned());
+    send_transaction_xdr(env, &fully_signed_xdr)
+        .await
+        .with_context(|| format!("failed to submit sponsored invocation for `{contract_id}`"))?;
+
+    Ok(ContractTxResult { tx_hash })
+}
+
 fn parse_invoke_output(stdout: String) -> String {
     match serde_json::from_str::<Value>(&stdout) {
         Ok(Value::String(value)) => value,
@@ -777,9 +1477,22 @@ fn parse_invoke_output(stdout: String) -> String {
 }
 
 struct LiquidityTotalsParsed {
+    idle_yes_total: String,
+    idle_no_total: String,
     posted_yes_total: String,
     posted_no_total: String,
     claimable_collateral_total: String,
+}
+
+struct LiquidityPositionParsed {
+    posted_yes_amount: String,
+    posted_no_amount: String,
+    idle_yes_amount: String,
+    idle_no_amount: String,
+    collateral_amount: String,
+    claimable_collateral_amount: String,
+    timestamp: u64,
+    active: bool,
 }
 
 fn parse_liquidity_totals(raw: &str) -> Result<LiquidityTotalsParsed> {
@@ -790,9 +1503,44 @@ fn parse_liquidity_totals(raw: &str) -> Result<LiquidityTotalsParsed> {
         .ok_or_else(|| anyhow!("liquidity totals output was not an object"))?;
 
     Ok(LiquidityTotalsParsed {
+        idle_yes_total: json_string_field(object, "idle_yes_total")?,
+        idle_no_total: json_string_field(object, "idle_no_total")?,
         posted_yes_total: json_string_field(object, "posted_yes_total")?,
         posted_no_total: json_string_field(object, "posted_no_total")?,
         claimable_collateral_total: json_string_field(object, "claimable_collateral_total")?,
+    })
+}
+
+fn parse_liquidity_position(raw: &str) -> Result<LiquidityPositionReadResult> {
+    let parsed = parse_liquidity_position_fields(raw)?;
+    Ok(LiquidityPositionReadResult {
+        posted_yes_amount: parsed.posted_yes_amount,
+        posted_no_amount: parsed.posted_no_amount,
+        idle_yes_amount: parsed.idle_yes_amount,
+        idle_no_amount: parsed.idle_no_amount,
+        collateral_amount: parsed.collateral_amount,
+        claimable_collateral_amount: parsed.claimable_collateral_amount,
+        updated_at: timestamp_to_datetime(parsed.timestamp),
+        active: parsed.active,
+    })
+}
+
+fn parse_liquidity_position_fields(raw: &str) -> Result<LiquidityPositionParsed> {
+    let value: Value = serde_json::from_str(raw)
+        .with_context(|| format!("failed to decode liquidity position output: {raw}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("liquidity position output was not an object"))?;
+
+    Ok(LiquidityPositionParsed {
+        posted_yes_amount: json_string_field(object, "yes_amount")?,
+        posted_no_amount: json_string_field(object, "no_amount")?,
+        idle_yes_amount: json_string_field(object, "idle_yes_amount")?,
+        idle_no_amount: json_string_field(object, "idle_no_amount")?,
+        collateral_amount: json_string_field(object, "collateral_amount")?,
+        claimable_collateral_amount: json_string_field(object, "claimable_collateral_amount")?,
+        timestamp: json_u64_field(object, "timestamp")?,
+        active: json_bool_field(object, "active")?,
     })
 }
 
@@ -808,4 +1556,37 @@ fn json_string_field(
         Value::Number(value) => Ok(value.to_string()),
         _ => Err(anyhow!("unexpected value type for contract field `{field}`")),
     }
+}
+
+fn json_u64_field(object: &serde_json::Map<String, Value>, field: &str) -> Result<u64> {
+    let value = object
+        .get(field)
+        .ok_or_else(|| anyhow!("missing field `{field}` in contract output"))?;
+    match value {
+        Value::String(value) => value
+            .parse::<u64>()
+            .with_context(|| format!("invalid integer for contract field `{field}`")),
+        Value::Number(value) => value
+            .as_u64()
+            .ok_or_else(|| anyhow!("invalid integer for contract field `{field}`")),
+        _ => Err(anyhow!("unexpected value type for contract field `{field}`")),
+    }
+}
+
+fn json_bool_field(object: &serde_json::Map<String, Value>, field: &str) -> Result<bool> {
+    let value = object
+        .get(field)
+        .ok_or_else(|| anyhow!("missing field `{field}` in contract output"))?;
+    match value {
+        Value::Bool(value) => Ok(*value),
+        _ => Err(anyhow!("unexpected value type for contract field `{field}`")),
+    }
+}
+
+fn timestamp_to_datetime(timestamp: u64) -> Option<DateTime<Utc>> {
+    if timestamp == 0 {
+        return None;
+    }
+
+    DateTime::from_timestamp(timestamp as i64, 0)
 }
