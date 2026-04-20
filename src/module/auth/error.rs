@@ -61,6 +61,10 @@ impl AuthError {
             message: "internal server error".to_owned(),
         }
     }
+
+    pub fn is_conflict(&self) -> bool {
+        self.status == StatusCode::CONFLICT
+    }
 }
 
 impl std::fmt::Display for AuthError {

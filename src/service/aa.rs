@@ -58,7 +58,7 @@ async fn ensure_user_managed_smart_wallet(
         .await
         .map_err(|error| AuthError::internal("failed to deploy smart wallet", error))?;
 
-    crud::upsert_managed_wallet(
+    match crud::upsert_managed_wallet(
         &state.db,
         &state.env,
         user.id,
@@ -72,9 +72,21 @@ async fn ensure_user_managed_smart_wallet(
             owner_key_version: owner.key_version,
         },
     )
-    .await?;
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(error) if error.is_conflict() => {
+            let existing_wallet = crud::get_wallet_for_user(&state.db, user.id).await?;
 
-    Ok(())
+            if matches!(existing_wallet, Some(wallet) if wallet.account_kind == ACCOUNT_KIND_STELLAR_SMART_WALLET && wallet.wallet_address.is_some())
+            {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn ensure_managed_owner_account(
