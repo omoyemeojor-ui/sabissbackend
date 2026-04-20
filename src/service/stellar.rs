@@ -1,12 +1,12 @@
-use std::process::Stdio;
-
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use tokio::process::Command;
 use tokio::time::{Duration, sleep};
 
-use crate::config::environment::Environment;
+use crate::{
+    config::environment::Environment,
+    service::soroban_rpc::SorobanRpc,
+};
 
 #[derive(Debug, Clone)]
 pub struct NegRiskRegistrationTxResult {
@@ -84,7 +84,7 @@ pub struct LiquidityPositionReadResult {
 }
 
 const DEFAULT_RESOLUTION_DISPUTE_WINDOW_SECONDS: i64 = 86_400;
-const STELLAR_PLACEHOLDER_TX_HASH: &str = "stellar-cli-submitted";
+const STELLAR_PLACEHOLDER_TX_HASH: &str = "soroban-rpc-submitted";
 
 pub async fn deploy_wallet_contract(
     env: &Environment,
@@ -1270,7 +1270,7 @@ async fn invoke_contract(
     send: bool,
     contract_args: &[&str],
 ) -> Result<String> {
-    let source_account = env.private_key.as_deref().unwrap_or(&env.source);
+    let source_account = env.private_key.as_deref().unwrap_or(&env.admin);
     invoke_contract_as_source(env, source_account, contract_id, send, contract_args).await
 }
 
@@ -1281,199 +1281,63 @@ async fn invoke_contract_as_source(
     send: bool,
     contract_args: &[&str],
 ) -> Result<String> {
-    let mut command = Command::new("stellar");
-    command
-        .arg("contract")
-        .arg("invoke")
-        .arg("--network")
-        .arg(&env.network)
-        .arg("--source-account")
-        .arg(source_account)
-        .arg("--id")
-        .arg(contract_id)
-        .arg("--send")
-        .arg(if send { "yes" } else { "no" })
-        .arg("--")
-        .args(contract_args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let rpc = SorobanRpc::new(env);
+    let (method, args) = contract_invocation_args(contract_args)?;
 
-    let output = command
-        .output()
-        .await
-        .with_context(|| format!("failed to execute `stellar contract invoke` for `{contract_id}`"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        let detail = if !stderr.is_empty() { stderr } else { stdout };
-        return Err(anyhow!(
-            "stellar contract invoke failed for `{contract_id}`: {detail}"
-        ));
+    if send {
+        let secret_key = if source_account.trim().starts_with('S') {
+            source_account
+        } else {
+            env.private_key
+                .as_deref()
+                .ok_or_else(|| anyhow!("PRIVATE_KEY not configured"))?
+        };
+        rpc.invoke(contract_id, method, &args, source_account, secret_key)
+            .await
+            .map(|response| response.value)
+            .with_context(|| format!("failed to invoke `{method}` on `{contract_id}`"))
+    } else {
+        rpc.simulate(contract_id, method, &args)
+            .await
+            .with_context(|| format!("failed to simulate `{method}` on `{contract_id}`"))
     }
-
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    Ok(parse_invoke_output(stdout))
 }
 
-pub async fn build_contract_invocation_xdr(
+pub async fn submit_contract_as_source(
     env: &Environment,
-    source_account: &str,
-    contract_id: &str,
-    contract_args: &[&str],
-) -> Result<String> {
-    let mut command = Command::new("stellar");
-    command
-        .arg("contract")
-        .arg("invoke")
-        .arg("--network")
-        .arg(&env.network)
-        .arg("--source-account")
-        .arg(source_account)
-        .arg("--id")
-        .arg(contract_id)
-        .arg("--build-only")
-        .arg("--")
-        .args(contract_args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let output = command
-        .output()
-        .await
-        .with_context(|| format!("failed to build XDR for `{contract_id}`"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        let detail = if !stderr.is_empty() { stderr } else { stdout };
-        return Err(anyhow!("stellar contract build failed: {detail}"));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
-}
-
-pub async fn sign_transaction_xdr(
-    env: &Environment,
-    xdr: &str,
-    secret_key: &str,
-) -> Result<String> {
-    let mut command = Command::new("stellar");
-    command
-        .arg("tx")
-        .arg("sign")
-        .arg("--network")
-        .arg(&env.network)
-        .arg("--sign-with-key")
-        .arg(secret_key)
-        .arg(xdr)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let output = command
-        .output()
-        .await
-        .context("failed to execute `stellar tx sign`")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        let detail = if !stderr.is_empty() { stderr } else { stdout };
-        return Err(anyhow!("stellar tx sign failed: {detail}"));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
-}
-
-pub async fn hash_transaction_xdr(env: &Environment, xdr: &str) -> Result<String> {
-    let mut command = Command::new("stellar");
-    command
-        .arg("tx")
-        .arg("hash")
-        .arg("--network")
-        .arg(&env.network)
-        .arg(xdr)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let output = command
-        .output()
-        .await
-        .context("failed to execute `stellar tx hash`")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        let detail = if !stderr.is_empty() { stderr } else { stdout };
-        return Err(anyhow!("stellar tx hash failed: {detail}"));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
-}
-
-pub async fn send_transaction_xdr(env: &Environment, xdr: &str) -> Result<String> {
-    let mut command = Command::new("stellar");
-    command
-        .arg("tx")
-        .arg("send")
-        .arg("--network")
-        .arg(&env.network)
-        .arg(xdr)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let output = command
-        .output()
-        .await
-        .context("failed to execute `stellar tx send`")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        let detail = if !stderr.is_empty() { stderr } else { stdout };
-        return Err(anyhow!("stellar tx send failed: {detail}"));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
-}
-
-pub async fn invoke_contract_with_sponsor(
-    env: &Environment,
-    user_signing_key: &str,
+    source_secret_key: &str,
     contract_id: &str,
     contract_args: &[&str],
 ) -> Result<ContractTxResult> {
-    let sponsor_signing_key = env
-        .private_key
-        .as_deref()
-        .ok_or_else(|| anyhow!("PRIVATE_KEY is required for sponsored submissions"))?;
-    let unsigned_xdr =
-        build_contract_invocation_xdr(env, sponsor_signing_key, contract_id, contract_args)
-            .await
-            .with_context(|| {
-                format!("failed to build sponsored invocation XDR for `{contract_id}`")
-            })?;
-    let user_signed_xdr = sign_transaction_xdr(env, &unsigned_xdr, user_signing_key)
+    let rpc = SorobanRpc::new(env);
+    let (method, args) = contract_invocation_args(contract_args)?;
+    let response = rpc
+        .invoke(contract_id, method, &args, source_secret_key, source_secret_key)
         .await
-        .context("failed to sign sponsored transaction with user key")?;
-    let fully_signed_xdr = sign_transaction_xdr(env, &user_signed_xdr, sponsor_signing_key)
-        .await
-        .context("failed to sign sponsored transaction with sponsor key")?;
-    let tx_hash = hash_transaction_xdr(env, &fully_signed_xdr)
-        .await
-        .unwrap_or_else(|_| STELLAR_PLACEHOLDER_TX_HASH.to_owned());
-    send_transaction_xdr(env, &fully_signed_xdr)
-        .await
-        .with_context(|| format!("failed to submit sponsored invocation for `{contract_id}`"))?;
+        .with_context(|| format!("failed to submit `{method}` on `{contract_id}` through RPC"))?;
 
-    Ok(ContractTxResult { tx_hash })
+    Ok(ContractTxResult {
+        tx_hash: response.tx_hash,
+    })
 }
 
-fn parse_invoke_output(stdout: String) -> String {
-    match serde_json::from_str::<Value>(&stdout) {
-        Ok(Value::String(value)) => value,
-        _ => stdout,
+fn contract_invocation_args<'a>(contract_args: &'a [&'a str]) -> Result<(&'a str, Vec<(&'a str, &'a str)>)> {
+    if contract_args.is_empty() {
+        return Err(anyhow!("contract_args cannot be empty"));
     }
+
+    let method = contract_args[0];
+    let raw_args = &contract_args[1..];
+    let args = raw_args
+        .chunks(2)
+        .filter(|chunk| chunk.len() == 2)
+        .map(|chunk| {
+            let key = chunk[0].strip_prefix("--").unwrap_or(chunk[0]);
+            (key, chunk[1])
+        })
+        .collect();
+
+    Ok((method, args))
 }
 
 struct LiquidityTotalsParsed {

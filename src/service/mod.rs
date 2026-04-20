@@ -11,6 +11,7 @@ pub mod market_auto_create;
 pub mod market_auto_resolution;
 pub mod order;
 pub mod orderbook;
+pub mod soroban_rpc;
 pub mod stellar;
 pub mod trading;
 pub mod upload;

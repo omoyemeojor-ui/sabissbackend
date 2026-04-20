@@ -354,7 +354,7 @@ fn map_trade_chain_error(context: &'static str, error: anyhow::Error) -> AuthErr
 }
 
 fn normalize_persisted_tx_hash(tx_hash: &str) -> Option<String> {
-    if tx_hash == "stellar-cli-submitted" {
+    if tx_hash == "soroban-rpc-submitted" {
         None
     } else {
         Some(tx_hash.to_owned())

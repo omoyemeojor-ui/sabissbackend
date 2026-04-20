@@ -422,7 +422,7 @@ async fn execute_market_write(
                         .await? =>
                 {
                     Ok(stellar::ContractTxResult {
-                        tx_hash: "stellar-cli-submitted".to_owned(),
+                        tx_hash: "soroban-rpc-submitted".to_owned(),
                     })
                 }
                 Err(error) => Err(error),
@@ -525,7 +525,7 @@ async fn add_liquidity_with_retry(
                 .await? =>
             {
                 return Ok(stellar::ContractTxResult {
-                    tx_hash: "stellar-cli-submitted".to_owned(),
+                    tx_hash: "soroban-rpc-submitted".to_owned(),
                 });
             }
             Err(error)
