@@ -84,6 +84,7 @@ pub struct LiquidityPositionReadResult {
 }
 
 const DEFAULT_RESOLUTION_DISPUTE_WINDOW_SECONDS: i64 = 86_400;
+const DEFAULT_ALLOWANCE_LEDGER_WINDOW: u32 = 1_000;
 const STELLAR_PLACEHOLDER_TX_HASH: &str = "soroban-rpc-submitted";
 
 pub async fn deploy_wallet_contract(
@@ -365,15 +366,20 @@ pub async fn buy_market_outcome(
     outcome_index: u32,
     usdc_amount: &str,
 ) -> Result<ContractTxResult> {
+    // `buy_outcome` performs a direct `token.transfer(buyer, exchange, amount)`,
+    // so testnet buys need collateral on the buyer address, not an allowance.
+    ensure_mock_usdc_balance(env, buyer, usdc_amount)
+        .await
+        .context("failed to fund Mock USDC for Soroban exchange buy")?;
     ensure_exchange_max_trade_amount(env, usdc_amount)
         .await
         .context("failed to raise Soroban exchange max trade amount for buy")?;
     let condition_id = bytes32_cli_arg(condition_id)?;
-    invoke_contract_as_source(
+    invoke_contract_for_actor(
         env,
         source_account,
+        buyer,
         &env.sabi_exchange_id,
-        true,
         &[
             "buy_outcome",
             "--buyer",
@@ -403,11 +409,11 @@ pub async fn sell_market_outcome(
     token_amount: &str,
 ) -> Result<ContractTxResult> {
     let condition_id = bytes32_cli_arg(condition_id)?;
-    invoke_contract_as_source(
+    invoke_contract_for_actor(
         env,
         source_account,
+        seller,
         &env.sabi_exchange_id,
-        true,
         &[
             "sell_outcome",
             "--seller",
@@ -435,12 +441,15 @@ pub async fn split_market_position(
     condition_id: &str,
     collateral_amount: &str,
 ) -> Result<ContractTxResult> {
+    ensure_mock_usdc_allowance(env, source_account, user, &env.sabi_ctf_id, collateral_amount)
+        .await
+        .context("failed to approve Mock USDC for Soroban conditional tokens split")?;
     let condition_id = bytes32_cli_arg(condition_id)?;
-    invoke_contract_as_source(
+    invoke_contract_for_actor(
         env,
         source_account,
+        user,
         &env.sabi_ctf_id,
-        true,
         &[
             "split_position",
             "--user",
@@ -473,11 +482,11 @@ pub async fn merge_market_positions(
     pair_token_amount: &str,
 ) -> Result<ContractTxResult> {
     let condition_id = bytes32_cli_arg(condition_id)?;
-    invoke_contract_as_source(
+    invoke_contract_for_actor(
         env,
         source_account,
+        user,
         &env.sabi_ctf_id,
-        true,
         &[
             "merge_positions",
             "--user",
@@ -578,44 +587,24 @@ pub async fn bootstrap_market_liquidity(
 ) -> Result<BootstrapMarketLiquidityTxResult> {
     let prices = set_market_prices(env, condition_id, yes_bps, no_bps).await?;
     let condition_id = bytes32_cli_arg(condition_id)?;
+    let admin_source_account = env.private_key.as_deref().unwrap_or(&env.admin);
 
-    invoke_contract(
+    split_market_position(
         env,
-        &env.sabi_ctf_id,
-        true,
-        &[
-            "split_position",
-            "--user",
-            &env.admin,
-            "--collateral-token",
-            &env.mock_usdc_id,
-            "--parent-collection-id",
-            "0000000000000000000000000000000000000000000000000000000000000000",
-            "--condition-id",
-            condition_id.as_str(),
-            "--amount",
-            inventory_usdc_amount,
-            "--partition",
-            "[1,2]",
-        ],
+        admin_source_account,
+        &env.admin,
+        condition_id.as_str(),
+        inventory_usdc_amount,
     )
     .await
     .context("failed to split bootstrap collateral on Soroban")?;
-    invoke_contract(
+    deposit_inventory(
         env,
-        &env.sabi_liquidity_manager_id,
-        true,
-        &[
-            "deposit_inventory",
-            "--provider",
-            &env.admin,
-            "--condition-id",
-            condition_id.as_str(),
-            "--yes-amount",
-            inventory_usdc_amount,
-            "--no-amount",
-            inventory_usdc_amount,
-        ],
+        admin_source_account,
+        &env.admin,
+        condition_id.as_str(),
+        inventory_usdc_amount,
+        inventory_usdc_amount,
     )
     .await
     .context("failed to deposit bootstrap inventory through Soroban liquidity manager")?;
@@ -642,19 +631,12 @@ pub async fn bootstrap_market_liquidity(
         ensure_exchange_max_trade_amount(env, exit_collateral_usdc_amount)
             .await
             .context("failed to raise Soroban exchange max trade amount for collateral bootstrap")?;
-        invoke_contract(
+        deposit_collateral(
             env,
-            &env.sabi_liquidity_manager_id,
-            true,
-            &[
-                "deposit_collateral",
-                "--provider",
-                &env.admin,
-                "--condition-id",
-                condition_id.as_str(),
-                "--amount",
-                exit_collateral_usdc_amount,
-            ],
+            admin_source_account,
+            &env.admin,
+            condition_id.as_str(),
+            exit_collateral_usdc_amount,
         )
         .await
         .context("failed to deposit exit collateral through Soroban liquidity manager")?;
@@ -790,11 +772,11 @@ pub async fn deposit_inventory(
     no_amount: &str,
 ) -> Result<ContractTxResult> {
     let condition_id = bytes32_cli_arg(condition_id)?;
-    invoke_contract_as_source(
+    invoke_contract_for_actor(
         env,
         source_account,
+        provider,
         &env.sabi_liquidity_manager_id,
-        true,
         &[
             "deposit_inventory",
             "--provider",
@@ -824,11 +806,11 @@ pub async fn add_liquidity(
     no_amount: &str,
 ) -> Result<ContractTxResult> {
     let condition_id = bytes32_cli_arg(condition_id)?;
-    invoke_contract_as_source(
+    invoke_contract_for_actor(
         env,
         source_account,
+        provider,
         &env.sabi_liquidity_manager_id,
-        true,
         &[
             "add_liquidity",
             "--provider",
@@ -856,15 +838,24 @@ pub async fn deposit_collateral(
     condition_id: &str,
     amount: &str,
 ) -> Result<ContractTxResult> {
+    ensure_mock_usdc_allowance(
+        env,
+        source_account,
+        provider,
+        &env.sabi_liquidity_manager_id,
+        amount,
+    )
+    .await
+    .context("failed to approve Mock USDC for Soroban liquidity manager")?;
     ensure_exchange_max_trade_amount(env, amount)
         .await
         .context("failed to raise Soroban exchange max trade amount for collateral deposit")?;
     let condition_id = bytes32_cli_arg(condition_id)?;
-    invoke_contract_as_source(
+    invoke_contract_for_actor(
         env,
         source_account,
+        provider,
         &env.sabi_liquidity_manager_id,
-        true,
         &[
             "deposit_collateral",
             "--provider",
@@ -892,11 +883,11 @@ pub async fn remove_liquidity(
     no_amount: &str,
 ) -> Result<ContractTxResult> {
     let condition_id = bytes32_cli_arg(condition_id)?;
-    invoke_contract_as_source(
+    invoke_contract_for_actor(
         env,
         source_account,
+        provider,
         &env.sabi_liquidity_manager_id,
-        true,
         &[
             "remove_liquidity",
             "--provider",
@@ -927,11 +918,11 @@ pub async fn withdraw_inventory(
     recipient: &str,
 ) -> Result<ContractTxResult> {
     let condition_id = bytes32_cli_arg(condition_id)?;
-    invoke_contract_as_source(
+    invoke_contract_for_actor(
         env,
         source_account,
+        provider,
         &env.sabi_liquidity_manager_id,
-        true,
         &[
             "withdraw_inventory",
             "--provider",
@@ -966,11 +957,11 @@ pub async fn withdraw_collateral(
         .await
         .context("failed to raise Soroban exchange max trade amount for collateral withdrawal")?;
     let condition_id = bytes32_cli_arg(condition_id)?;
-    invoke_contract_as_source(
+    invoke_contract_for_actor(
         env,
         source_account,
+        provider,
         &env.sabi_liquidity_manager_id,
-        true,
         &[
             "withdraw_collateral",
             "--provider",
@@ -1014,6 +1005,22 @@ pub async fn get_mock_usdc_balance(env: &Environment, address: &str) -> Result<S
     invoke_contract(env, &env.mock_usdc_id, false, &["balance", "--id", address])
         .await
         .context("failed to read Mock USDC balance on Soroban")
+}
+
+pub async fn get_mock_usdc_allowance(
+    env: &Environment,
+    owner: &str,
+    spender: &str,
+) -> Result<String> {
+    let rpc = SorobanRpc::new(env);
+    rpc.simulate_with_metadata(
+        &env.mock_usdc_id,
+        "allowance",
+        &[("from", owner), ("spender", spender)],
+    )
+    .await
+    .map(|result| result.value)
+    .context("failed to read Mock USDC allowance on Soroban")
 }
 
 pub async fn get_exchange_max_trade_amount(env: &Environment) -> Result<String> {
@@ -1135,6 +1142,61 @@ pub async fn ensure_mock_usdc_balance(
     Ok(())
 }
 
+pub async fn ensure_mock_usdc_allowance(
+    env: &Environment,
+    source_account: &str,
+    owner: &str,
+    spender: &str,
+    minimum_amount: &str,
+) -> Result<()> {
+    let required = parse_nonnegative_amount(minimum_amount, "minimum Mock USDC allowance")?;
+    if required == 0 {
+        return Ok(());
+    }
+
+    let rpc = SorobanRpc::new(env);
+    let simulated = rpc
+        .simulate_with_metadata(
+            &env.mock_usdc_id,
+            "allowance",
+            &[("from", owner), ("spender", spender)],
+        )
+        .await
+        .with_context(|| format!("failed to read Mock USDC allowance for `{owner}` -> `{spender}`"))?;
+    let existing = parse_nonnegative_amount(&simulated.value, "Mock USDC allowance")?;
+    if existing >= required {
+        return Ok(());
+    }
+
+    let expiration_ledger = simulated
+        .latest_ledger
+        .checked_add(DEFAULT_ALLOWANCE_LEDGER_WINDOW)
+        .ok_or_else(|| anyhow!("Mock USDC allowance expiration ledger overflowed"))?;
+    let amount_arg = minimum_amount.to_owned();
+    let expiration_arg = expiration_ledger.to_string();
+    invoke_contract_for_actor(
+        env,
+        source_account,
+        owner,
+        &env.mock_usdc_id,
+        &[
+            "approve",
+            "--from",
+            owner,
+            "--spender",
+            spender,
+            "--amount",
+            amount_arg.as_str(),
+            "--expiration-ledger",
+            expiration_arg.as_str(),
+        ],
+    )
+    .await
+    .with_context(|| format!("failed to approve Mock USDC for `{spender}` from `{owner}`"))?;
+
+    Ok(())
+}
+
 fn is_retryable_submission_error(error: &anyhow::Error) -> bool {
     let message = format!("{error:#}").to_ascii_lowercase();
     message.contains("transaction submission timeout")
@@ -1251,6 +1313,18 @@ fn bool_arg(value: bool) -> &'static str {
     if value { "true" } else { "false" }
 }
 
+fn parse_nonnegative_amount(value: &str, context: &str) -> Result<u128> {
+    let parsed = value
+        .trim()
+        .parse::<i128>()
+        .with_context(|| format!("invalid {context} `{value}`"))?;
+    if parsed < 0 {
+        return Err(anyhow!("{context} cannot be negative"));
+    }
+
+    Ok(parsed as u128)
+}
+
 fn bytes32_cli_arg(value: &str) -> Result<String> {
     let normalized = value.trim();
     let normalized = normalized.trim_matches('"');
@@ -1303,6 +1377,44 @@ async fn invoke_contract_as_source(
     }
 }
 
+async fn invoke_contract_for_actor(
+    env: &Environment,
+    authorizer_secret_key: &str,
+    actor_address: &str,
+    contract_id: &str,
+    contract_args: &[&str],
+) -> Result<String> {
+    let rpc = SorobanRpc::new(env);
+    let (method, args) = contract_invocation_args(contract_args)?;
+
+    if actor_address.trim().starts_with('C') {
+        let tx_source_secret_key = env
+            .private_key
+            .as_deref()
+            .unwrap_or(authorizer_secret_key);
+        let tx_source_account = env
+            .private_key
+            .as_deref()
+            .map(|_| env.stellar_aa_sponsor_address.as_str())
+            .unwrap_or(authorizer_secret_key);
+        return rpc
+            .invoke_with_contract_authorization(
+                contract_id,
+                method,
+                &args,
+                tx_source_account,
+                tx_source_secret_key,
+                actor_address,
+                authorizer_secret_key,
+            )
+            .await
+            .map(|response| response.value)
+            .with_context(|| format!("failed to invoke `{method}` on `{contract_id}`"));
+    }
+
+    invoke_contract_as_source(env, authorizer_secret_key, contract_id, true, contract_args).await
+}
+
 pub async fn submit_contract_as_source(
     env: &Environment,
     source_secret_key: &str,
@@ -1315,6 +1427,43 @@ pub async fn submit_contract_as_source(
         .invoke(contract_id, method, &args, source_secret_key, source_secret_key)
         .await
         .with_context(|| format!("failed to submit `{method}` on `{contract_id}` through RPC"))?;
+
+    Ok(ContractTxResult {
+        tx_hash: response.tx_hash,
+    })
+}
+
+pub async fn submit_contract_as_smart_wallet(
+    env: &Environment,
+    owner_secret_key: &str,
+    wallet_contract_id: &str,
+    contract_id: &str,
+    contract_args: &[&str],
+) -> Result<ContractTxResult> {
+    let rpc = SorobanRpc::new(env);
+    let (method, args) = contract_invocation_args(contract_args)?;
+    let tx_source_secret_key = env.private_key.as_deref().unwrap_or(owner_secret_key);
+    let tx_source_account = env
+        .private_key
+        .as_deref()
+        .map(|_| env.stellar_aa_sponsor_address.as_str())
+        .unwrap_or(owner_secret_key);
+    let response = rpc
+        .invoke_with_contract_authorization(
+            contract_id,
+            method,
+            &args,
+            tx_source_account,
+            tx_source_secret_key,
+            wallet_contract_id,
+            owner_secret_key,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "failed to submit `{method}` on `{contract_id}` through smart-wallet RPC"
+            )
+        })?;
 
     Ok(ContractTxResult {
         tx_hash: response.tx_hash,

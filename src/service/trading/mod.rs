@@ -278,8 +278,9 @@ async fn load_signing_wallet_context(
         ));
     }
 
-    let _contract_wallet_address = wallet
+    let contract_wallet_address = wallet
         .wallet_address
+        .clone()
         .ok_or_else(|| AuthError::forbidden("wallet is not deployed"))?;
     let owner_address = wallet
         .owner_address
@@ -302,7 +303,7 @@ async fn load_signing_wallet_context(
     Ok(SigningWalletContext {
         wallet_address: owner_address.clone(),
         account_kind: "smart_account".to_owned(),
-        actor_address: owner_address,
+        actor_address: contract_wallet_address,
         source_account,
     })
 }

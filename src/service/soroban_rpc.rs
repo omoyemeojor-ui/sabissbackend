@@ -9,10 +9,12 @@ use serde_json::{Map, Number, Value};
 use sha2::{Digest, Sha256};
 use stellar_strkey::{Strkey, ed25519};
 use stellar_xdr::curr::{
-    AccountId, ContractId, DecoratedSignature, Hash, Int128Parts, InvokeContractArgs,
-    InvokeHostFunctionOp, Limits, Memo, MuxedAccount, Operation, OperationBody, Preconditions,
-    PublicKey, ReadXdr, ScAddress, ScBytes, ScSymbol, ScVal, ScVec, SequenceNumber,
-    Signature, SignatureHint, SorobanAuthorizationEntry, SorobanTransactionData, Transaction,
+    AccountId, ContractId, DecoratedSignature, Hash, HashIdPreimage,
+    HashIdPreimageSorobanAuthorization, Int128Parts, InvokeContractArgs,
+    InvokeHostFunctionOp, LedgerEntryData, LedgerKey, LedgerKeyAccount, Limits, Memo,
+    MuxedAccount, Operation, OperationBody, Preconditions, PublicKey, ReadXdr, ScAddress,
+    ScBytes, ScSymbol, ScVal, ScVec, SequenceNumber, Signature, SignatureHint,
+    SorobanAuthorizationEntry, SorobanCredentials, SorobanTransactionData, Transaction,
     TransactionEnvelope, TransactionExt, TransactionV1Envelope, Uint256, WriteXdr,
 };
 
@@ -25,13 +27,17 @@ const TRANSACTION_POLL_DELAY_MS: u64 = 500;
 pub struct SorobanRpc {
     client: Client,
     rpc_urls: Vec<String>,
-    horizon_urls: Vec<String>,
     network_passphrase: String,
     simulation_source_account: String,
 }
 
 pub struct InvokeResponse {
     pub tx_hash: String,
+    pub value: String,
+}
+
+pub struct SimulateResponse {
+    pub latest_ledger: u32,
     pub value: String,
 }
 
@@ -60,17 +66,23 @@ struct RpcError {
 #[derive(Serialize)]
 struct SimulateTransactionParams {
     transaction: String,
+    #[serde(rename = "authMode", skip_serializing_if = "Option::is_none")]
+    auth_mode: Option<&'static str>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SimulateTransactionResult {
+    #[allow(dead_code)]
+    latest_ledger: u32,
     #[serde(default)]
     transaction_data: Option<String>,
     #[serde(default)]
     min_resource_fee: Option<String>,
     #[serde(default)]
     results: Vec<SimulatedInvocationResult>,
+    #[serde(default)]
+    error: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -107,12 +119,27 @@ struct GetTransactionResult {
     result_xdr: Option<String>,
 }
 
+#[derive(Serialize)]
+struct GetLedgerEntriesParams {
+    keys: Vec<String>,
+    #[serde(rename = "xdrFormat")]
+    xdr_format: &'static str,
+}
+
 #[derive(Deserialize)]
-struct HorizonAccountResponse {
-    sequence: String,
+#[serde(rename_all = "camelCase")]
+struct GetLedgerEntriesResult {
+    #[serde(default)]
+    entries: Vec<RpcLedgerEntry>,
+}
+
+#[derive(Deserialize)]
+struct RpcLedgerEntry {
+    xdr: String,
 }
 
 struct SimulatedTransaction {
+    latest_ledger: u32,
     value: String,
     min_resource_fee: u32,
     auth: Vec<SorobanAuthorizationEntry>,
@@ -126,20 +153,14 @@ impl SorobanRpc {
             .into_iter()
             .map(normalize_rpc_url)
             .collect();
-        let horizon_urls = env
-            .horizon_candidates()
-            .into_iter()
-            .map(|url| url.trim_end_matches('/').to_owned())
-            .collect();
         let client = Client::builder()
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(60))
             .build()
             .expect("failed to build HTTP client");
 
         Self {
             client,
             rpc_urls,
-            horizon_urls,
             network_passphrase: network_passphrase(&env.network).to_owned(),
             simulation_source_account: env.stellar_aa_sponsor_address.clone(),
         }
@@ -171,7 +192,7 @@ impl SorobanRpc {
             TransactionExt::V0,
         )?;
 
-        let simulated = self.simulate_transaction(&unsigned_tx).await?;
+        let simulated = self.simulate_transaction(&unsigned_tx, Some("record")).await?;
         let fee = BASE_TRANSACTION_FEE
             .checked_add(simulated.min_resource_fee)
             .ok_or_else(|| anyhow!("computed Soroban fee overflowed"))?;
@@ -195,12 +216,100 @@ impl SorobanRpc {
         })
     }
 
+    pub async fn invoke_with_contract_authorization(
+        &self,
+        contract_id: &str,
+        method: &str,
+        args: &[(&str, &str)],
+        tx_source_account: &str,
+        tx_source_secret_key: &str,
+        authorizing_contract: &str,
+        authorizing_secret_key: &str,
+    ) -> Result<InvokeResponse> {
+        let tx_source_account = resolve_source_account(tx_source_account, tx_source_secret_key)?;
+        let sequence = self
+            .get_account_sequence(&tx_source_account)
+            .await?
+            .parse::<i64>()
+            .with_context(|| format!("invalid account sequence for `{tx_source_account}`"))?;
+
+        let recording_tx = build_invoke_transaction(
+            &tx_source_account,
+            sequence + 1,
+            BASE_TRANSACTION_FEE,
+            contract_id,
+            method,
+            args,
+            Vec::new(),
+            TransactionExt::V0,
+        )?;
+        let recorded = self
+            .simulate_transaction(&recording_tx, Some("record"))
+            .await?;
+        let signed_auth = sign_contract_authorization_entries(
+            recorded.auth,
+            authorizing_contract,
+            authorizing_secret_key,
+            &self.network_passphrase,
+            recorded.latest_ledger,
+        )?;
+
+        let enforcing_tx = build_invoke_transaction(
+            &tx_source_account,
+            sequence + 1,
+            BASE_TRANSACTION_FEE,
+            contract_id,
+            method,
+            args,
+            signed_auth.clone(),
+            TransactionExt::V0,
+        )?;
+        let enforced = self.simulate_transaction(&enforcing_tx, None).await?;
+        let fee = BASE_TRANSACTION_FEE
+            .checked_add(enforced.min_resource_fee)
+            .ok_or_else(|| anyhow!("computed Soroban fee overflowed"))?;
+        let final_tx = build_invoke_transaction(
+            &tx_source_account,
+            sequence + 1,
+            fee,
+            contract_id,
+            method,
+            args,
+            signed_auth,
+            TransactionExt::V1(enforced.transaction_data),
+        )?;
+        let tx_hash = self
+            .submit_and_wait(&sign_transaction(
+                final_tx,
+                tx_source_secret_key,
+                &self.network_passphrase,
+            )?)
+            .await?;
+
+        Ok(InvokeResponse {
+            tx_hash,
+            value: enforced.value,
+        })
+    }
+
     pub async fn simulate(
         &self,
         contract_id: &str,
         method: &str,
         args: &[(&str, &str)],
     ) -> Result<String> {
+        Ok(self
+            .simulate_with_metadata(contract_id, method, args)
+            .await?
+            .value)
+    }
+
+    pub async fn simulate_with_metadata(
+        &self,
+        contract_id: &str,
+        method: &str,
+        args: &[(&str, &str)],
+    ) -> Result<SimulateResponse> {
         let sequence = self
             .get_account_sequence(&self.simulation_source_account)
             .await?
@@ -222,47 +331,71 @@ impl SorobanRpc {
             TransactionExt::V0,
         )?;
 
-        Ok(self.simulate_transaction(&tx).await?.value)
+        let simulated = self.simulate_transaction(&tx, None).await?;
+        Ok(SimulateResponse {
+            latest_ledger: simulated.latest_ledger,
+            value: simulated.value,
+        })
     }
 
     pub async fn get_account_sequence(&self, address: &str) -> Result<String> {
-        let mut failures = Vec::new();
-
-        for horizon_url in &self.horizon_urls {
-            let url = format!("{horizon_url}/accounts/{address}");
-            match self.client.get(&url).send().await {
-                Ok(response) if response.status().is_success() => {
-                    let account: HorizonAccountResponse = response
-                        .json()
-                        .await
-                        .context("failed to parse Horizon account response")?;
-                    return Ok(account.sequence);
-                }
-                Ok(response) => {
-                    let status = response.status();
-                    let body = response.text().await.unwrap_or_default();
-                    failures.push(format!("{url} returned {status}: {body}"));
-                }
-                Err(error) => failures.push(format!("{url} failed: {error}")),
-            }
-        }
-
-        Err(anyhow!(
-            "failed to fetch account sequence for `{address}`: {}",
-            failures.join(" | ")
-        ))
+        let account = self
+            .get_account_entry(address)
+            .await?
+            .ok_or_else(|| anyhow!("account `{address}` was not found via Soroban RPC"))?;
+        Ok(account.seq_num.0.to_string())
     }
 
-    async fn simulate_transaction(&self, tx: &TransactionEnvelope) -> Result<SimulatedTransaction> {
+    pub async fn account_exists(&self, address: &str) -> Result<bool> {
+        Ok(self.get_account_entry(address).await?.is_some())
+    }
+
+    async fn get_account_entry(&self, address: &str) -> Result<Option<stellar_xdr::curr::AccountEntry>> {
+        let key = ledger_key_to_base64(&LedgerKey::Account(LedgerKeyAccount {
+            account_id: stellar_account_to_account_id(address)?,
+        }))?;
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "getLedgerEntries",
+            params: GetLedgerEntriesParams {
+                keys: vec![key],
+                xdr_format: "base64",
+            },
+        };
+        let result: GetLedgerEntriesResult = self.send_request(&request).await?;
+        let Some(entry) = result.entries.into_iter().next() else {
+            return Ok(None);
+        };
+        let decoded = decode_xdr::<LedgerEntryData>(&entry.xdr)
+            .context("failed to decode account ledger entry")?;
+
+        match decoded {
+            LedgerEntryData::Account(account) => Ok(Some(account)),
+            other => Err(anyhow!(
+                "ledger entry for `{address}` was not an account entry: {other:?}"
+            )),
+        }
+    }
+
+    async fn simulate_transaction(
+        &self,
+        tx: &TransactionEnvelope,
+        auth_mode: Option<&'static str>,
+    ) -> Result<SimulatedTransaction> {
         let request = JsonRpcRequest {
             jsonrpc: "2.0",
             id: 1,
             method: "simulateTransaction",
             params: SimulateTransactionParams {
                 transaction: tx_to_base64(tx)?,
+                auth_mode,
             },
         };
         let result: SimulateTransactionResult = self.send_request(&request).await?;
+        if let Some(error) = result.error.clone() {
+            return Err(anyhow!("simulateTransaction failed: {error}"));
+        }
         let entry = result
             .results
             .into_iter()
@@ -291,6 +424,7 @@ impl SorobanRpc {
             .collect::<Result<Vec<_>>>()?;
 
         Ok(SimulatedTransaction {
+            latest_ledger: result.latest_ledger,
             value,
             min_resource_fee,
             auth,
@@ -385,10 +519,13 @@ impl SorobanRpc {
                 continue;
             }
 
-            let payload: JsonRpcResponse<TRes> = response
-                .json()
-                .await
-                .context("failed to parse RPC response body")?;
+            let payload: JsonRpcResponse<TRes> = match response.json().await {
+                Ok(payload) => payload,
+                Err(error) => {
+                    failures.push(format!("{rpc_url} failed to parse response body: {error}"));
+                    continue;
+                }
+            };
             if let Some(error) = payload.error {
                 return Err(anyhow!("RPC error {}: {}", error.code, error.message));
             }
@@ -472,6 +609,54 @@ fn sign_transaction(
     }
 }
 
+fn sign_contract_authorization_entries(
+    auth_entries: Vec<SorobanAuthorizationEntry>,
+    authorizing_contract: &str,
+    secret_key: &str,
+    network_passphrase: &str,
+    latest_ledger: u32,
+) -> Result<Vec<SorobanAuthorizationEntry>> {
+    let normalized_authorizer = authorizing_contract.trim().to_ascii_uppercase();
+    let (signing_key, _) = signing_key_from_secret(secret_key)?;
+    let expiration_ledger = latest_ledger
+        .checked_add(60)
+        .ok_or_else(|| anyhow!("authorization expiration ledger overflowed"))?;
+    let network_id = Hash(network_id(network_passphrase));
+
+    auth_entries
+        .into_iter()
+        .map(|mut entry| {
+            match &mut entry.credentials {
+                SorobanCredentials::SourceAccount => {}
+                SorobanCredentials::Address(credentials) => {
+                    let address = sc_address_to_string(&credentials.address)?;
+                    if address != normalized_authorizer {
+                        return Err(anyhow!(
+                            "recorded auth entry was for `{address}`, expected `{normalized_authorizer}`"
+                        ));
+                    }
+
+                    let preimage =
+                        HashIdPreimage::SorobanAuthorization(HashIdPreimageSorobanAuthorization {
+                            network_id: network_id.clone(),
+                            nonce: credentials.nonce,
+                            signature_expiration_ledger: expiration_ledger,
+                            invocation: entry.root_invocation.clone(),
+                        });
+                    let payload = Sha256::digest(preimage.to_xdr(Limits::none())?);
+                    let signature = signing_key.sign(payload.as_ref());
+                    credentials.signature_expiration_ledger = expiration_ledger;
+                    credentials.signature = ScVal::Bytes(ScBytes(
+                        signature.to_bytes().to_vec().try_into()?,
+                    ));
+                }
+            }
+
+            Ok(entry)
+        })
+        .collect()
+}
+
 fn resolve_source_account(source_account: &str, secret_key: &str) -> Result<String> {
     if is_secret_key(source_account) {
         return derive_public_key_from_secret(source_account);
@@ -511,20 +696,36 @@ fn encode_contract_argument(method: &str, name: &str, value: &str) -> Result<ScV
         (_, "other-market" | "parent-collection-id" | "collection-id" | "position-id") => {
             return bytes_scval(value);
         }
-        (_, "resolver" | "disputer" | "oracle" | "buyer" | "seller" | "user" | "provider") => {
+        (
+            _,
+            "resolver"
+            | "disputer"
+            | "oracle"
+            | "buyer"
+            | "seller"
+            | "user"
+            | "provider"
+            | "from"
+            | "spender"
+            | "operator",
+        ) => {
             return address_scval(value);
         }
         (_, "recipient" | "collateral-token" | "to") => return address_scval(value),
         (_, "id") if is_stellar_address(value) => return address_scval(value),
         (_, "end-time") => return u64_scval(value),
+        (_, "expiration-ledger") => return u32_scval(value),
         (_, "winning-outcome" | "outcome-index" | "price-bps" | "index-set") => {
             return u32_scval(value);
         }
         (_, "amount" | "yes-amount" | "no-amount" | "usdc-amount" | "token-amount") => {
-            return i128_scval(value);
+            if matches!(method, "mint" | "approve" | "transfer" | "transfer_from" | "burn") {
+                return i128_scval(value);
+            }
+            return u128_scval(value);
         }
-        (_, "collateral-amount" | "pair-token-amount") => return i128_scval(value),
-        (_, "neg-risk") => return bool_scval(value),
+        (_, "collateral-amount" | "pair-token-amount") => return u128_scval(value),
+        (_, "neg-risk" | "approved") => return bool_scval(value),
         (_, "partition") => return u32_vec_scval(value),
         _ => {}
     }
@@ -590,6 +791,18 @@ fn i128_scval(value: &str) -> Result<ScVal> {
     }))
 }
 
+fn u128_scval(value: &str) -> Result<ScVal> {
+    let parsed = value
+        .trim()
+        .parse::<u128>()
+        .with_context(|| format!("invalid u128 argument `{value}`"))?;
+    let bytes = parsed.to_be_bytes();
+    Ok(ScVal::U128(stellar_xdr::curr::UInt128Parts {
+        hi: u64::from_be_bytes(bytes[..8].try_into()?),
+        lo: u64::from_be_bytes(bytes[8..].try_into()?),
+    }))
+}
+
 fn u32_vec_scval(value: &str) -> Result<ScVal> {
     let inner = value.trim();
     let inner = inner
@@ -621,6 +834,15 @@ fn stellar_account_to_muxed(address: &str) -> Result<MuxedAccount> {
     }
 }
 
+fn stellar_account_to_account_id(address: &str) -> Result<AccountId> {
+    match Strkey::from_string(address.trim()).context("invalid stellar account address")? {
+        Strkey::PublicKeyEd25519(public_key) => Ok(AccountId(PublicKey::PublicKeyTypeEd25519(
+            Uint256(public_key.0),
+        ))),
+        _ => Err(anyhow!("expected a stellar G-address for account lookup")),
+    }
+}
+
 fn stellar_address_to_sc_address(address: &str) -> Result<ScAddress> {
     match Strkey::from_string(address.trim()).context("invalid stellar address")? {
         Strkey::PublicKeyEd25519(public_key) => Ok(ScAddress::Account(AccountId(
@@ -647,6 +869,11 @@ fn decode_xdr<T: ReadXdr>(value: &str) -> Result<T> {
 
 fn tx_to_base64(tx: &TransactionEnvelope) -> Result<String> {
     let bytes = tx.to_xdr(Limits::none())?;
+    Ok(BASE64.encode(bytes))
+}
+
+fn ledger_key_to_base64(key: &LedgerKey) -> Result<String> {
+    let bytes = key.to_xdr(Limits::none())?;
     Ok(BASE64.encode(bytes))
 }
 

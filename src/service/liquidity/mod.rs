@@ -663,11 +663,18 @@ async fn load_liquidity_wallet_context(
     let deployed_wallet_address = wallet
         .wallet_address
         .ok_or_else(|| AuthError::forbidden("wallet is not deployed"))?;
-    let actor_address = wallet
+    let actor_address = if wallet.account_kind == ACCOUNT_KIND_STELLAR_SMART_WALLET {
+        deployed_wallet_address.clone()
+    } else {
+        wallet
+            .owner_address
+            .clone()
+            .unwrap_or_else(|| deployed_wallet_address.clone())
+    };
+    let wallet_address = wallet
         .owner_address
         .clone()
         .unwrap_or_else(|| deployed_wallet_address.clone());
-    let wallet_address = actor_address.clone();
 
     if !require_managed {
         return Ok(LiquidityWalletContext {
@@ -698,7 +705,7 @@ async fn load_liquidity_wallet_context(
 
     Ok(LiquidityWalletContext {
         wallet_address,
-        actor_address,
+        actor_address: deployed_wallet_address,
         source_account: Some(encode_stellar_secret_key(&secret_seed_bytes)),
     })
 }

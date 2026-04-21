@@ -1,4 +1,4 @@
-use reqwest::StatusCode;
+use tokio::time::{Duration, sleep};
 use uuid::Uuid;
 
 use crate::{
@@ -10,7 +10,8 @@ use crate::{
     },
     service::{
         crypto::{self, create_managed_owner_key},
-        stellar::{deploy_wallet_contract, submit_contract_as_source},
+        soroban_rpc::SorobanRpc,
+        stellar::{deploy_wallet_contract, submit_contract_as_smart_wallet, submit_contract_as_source},
     },
 };
 
@@ -93,25 +94,13 @@ async fn ensure_managed_owner_account(
         return Ok(());
     }
 
-    let horizon_base = state.env.horizon_url.trim_end_matches('/');
-    let account_url = format!("{horizon_base}/accounts/{owner_address}");
-    let response = state
-        .http_client
-        .get(&account_url)
-        .send()
+    let rpc = SorobanRpc::new(&state.env);
+    if rpc
+        .account_exists(owner_address)
         .await
-        .map_err(|error| AuthError::internal("failed to check managed owner account", error))?;
-
-    if response.status() == StatusCode::OK {
+        .map_err(|error| AuthError::internal("failed to check managed owner account", error))?
+    {
         return Ok(());
-    }
-
-    if response.status() != StatusCode::NOT_FOUND {
-        let detail = response.text().await.unwrap_or_default();
-        return Err(AuthError::internal(
-            "failed to check managed owner account",
-            anyhow::anyhow!("unexpected horizon response: {detail}"),
-        ));
     }
 
     let response = state
@@ -130,7 +119,21 @@ async fn ensure_managed_owner_account(
         ));
     }
 
-    Ok(())
+    for _ in 0..10 {
+        if rpc
+            .account_exists(owner_address)
+            .await
+            .map_err(|error| AuthError::internal("failed to confirm managed owner account funding", error))?
+        {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+
+    Err(AuthError::internal(
+        "failed to confirm managed owner account funding",
+        anyhow::anyhow!("Friendbot funded `{owner_address}`, but Soroban RPC never observed the account"),
+    ))
 }
 
 pub async fn submit_gasless_transaction(
@@ -157,11 +160,27 @@ pub async fn submit_gasless_transaction(
         .map_err(|_| AuthError::internal("invalid private key length", anyhow::anyhow!("invalid private key length")))?;
     
     let secret_key_str = crypto::encode_stellar_secret_key(&private_key_array);
-    // Submit through the backend RPC flow so this path does not depend on
-    // the local Stellar CLI being installed in the deployment environment.
-    let tx = submit_contract_as_source(&state.env, &secret_key_str, contract_id, contract_args)
+    let tx = if wallet.account_kind == ACCOUNT_KIND_STELLAR_SMART_WALLET {
+        let wallet_contract_id = wallet
+            .wallet_address
+            .as_deref()
+            .ok_or_else(|| AuthError::forbidden("wallet is not deployed"))?;
+        submit_contract_as_smart_wallet(
+            &state.env,
+            &secret_key_str,
+            wallet_contract_id,
+            contract_id,
+            contract_args,
+        )
         .await
-        .map_err(|e| AuthError::internal("failed to submit smart-wallet transaction", e))?;
+        .map_err(|e| AuthError::internal("failed to submit smart-wallet transaction", e))?
+    } else {
+        // Submit through the backend RPC flow so this path does not depend on
+        // the local Stellar CLI being installed in the deployment environment.
+        submit_contract_as_source(&state.env, &secret_key_str, contract_id, contract_args)
+            .await
+            .map_err(|e| AuthError::internal("failed to submit wallet transaction", e))?
+    };
 
     Ok(tx.tx_hash)
 }

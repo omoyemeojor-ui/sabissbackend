@@ -3,7 +3,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Result, anyhow};
 use reqwest::Url;
 use sqlx::{PgPool, postgres::PgPoolOptions};
 
@@ -173,7 +173,8 @@ fn has_neon_endpoint_option(options: &str) -> bool {
 }
 
 pub async fn create_pool(env: &Environment) -> Result<DbPool> {
-    let database_url = prepare_database_url(&env.database_url).await;
+    let sanitized_database_url = sanitize_database_url(&env.database_url);
+    let prepared_database_url = prepare_database_url(&sanitized_database_url).await;
     let acquire_timeout = Duration::from_millis(env.db_acquire_timeout_ms);
 
     tracing::info!(
@@ -182,10 +183,53 @@ pub async fn create_pool(env: &Environment) -> Result<DbPool> {
         "configuring postgres pool"
     );
 
-    PgPoolOptions::new()
-        .max_connections(env.db_max_connections)
-        .acquire_timeout(acquire_timeout)
-        .connect(&database_url)
-        .await
-        .context("failed to connect to postgres")
+    let mut failures = Vec::new();
+    for max_connections in max_connection_candidates(env.db_max_connections) {
+        for (label, database_url) in
+            database_url_candidates(&prepared_database_url, &sanitized_database_url)
+        {
+            match PgPoolOptions::new()
+                .max_connections(max_connections)
+                .acquire_timeout(acquire_timeout)
+                .connect(database_url)
+                .await
+            {
+                Ok(pool) => {
+                    if label != "prepared" || max_connections != env.db_max_connections {
+                        tracing::warn!(
+                            candidate = label,
+                            configured_max_connections = env.db_max_connections,
+                            effective_max_connections = max_connections,
+                            "postgres connection succeeded after fallback"
+                        );
+                    }
+                    return Ok(pool);
+                }
+                Err(error) => failures.push(format!(
+                    "{label} database URL with max_connections={max_connections} failed: {error:#}"
+                )),
+            }
+        }
+    }
+
+    Err(anyhow!(
+        "failed to connect to postgres: {}",
+        failures.join(" | ")
+    ))
+}
+
+fn database_url_candidates<'a>(prepared: &'a str, sanitized: &'a str) -> Vec<(&'static str, &'a str)> {
+    let mut candidates = vec![("prepared", prepared)];
+    if prepared != sanitized {
+        candidates.push(("sanitized", sanitized));
+    }
+    candidates
+}
+
+fn max_connection_candidates(configured: u32) -> Vec<u32> {
+    let mut candidates = vec![configured];
+    if configured > 1 {
+        candidates.push(1);
+    }
+    candidates
 }
